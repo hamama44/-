@@ -1,0 +1,118 @@
+package com.example.notifications
+
+import android.Manifest
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.example.MainActivity
+import com.example.R
+import java.util.Calendar
+
+class StadiumNotificationReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        StadiumNotificationManager(context).showSabahoReminderNow()
+    }
+}
+
+class StadiumNotificationManager(private val context: Context) {
+    companion object {
+        const val CHANNEL_ID = "stadium_daily_challenge"
+        const val NOTIFICATION_ID = 1001
+        const val EXTRA_NAVIGATE_TO = "extra_navigate_to"
+        const val DESTINATION_SABAHO = "sabaho"
+    }
+
+    init {
+        createNotificationChannel()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "تذكيرات ملعب التحدي اليومية"
+            val descriptionText = "تنبيهات الدخول اليومي لصباحو تحدي والحفاظ على سلسلة الانتصارات"
+            val importance = NotificationManager.IMPORTANCE_HIGH
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+                enableLights(true)
+                enableVibration(true)
+            }
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    fun showSabahoReminderNow() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+        }
+
+        val intent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_NAVIGATE_TO, DESTINATION_SABAHO)
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("🔥 لا تكسر سلسلة انتصاراتك اليومية!")
+            .setContentText("جولة جديدة من 'صباحو تحدي' بانتظارك! أثبت معلوماتك التكتيكية واحصد كؤوس الذهب 🏆⚽")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("جولة جديدة ومثيرة من 'صباحو تحدي' تنتظرك الآن في ملعب التحدي! استخدم وسائل المساعدة الثلاث (50:50، تغيير السؤال، والوقت الإضافي) للمحافظة على سلسلة انتصاراتك النارية 🔥⚽🏆")
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .build()
+
+        NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, notification)
+    }
+
+    fun scheduleDailySabahoReminder() {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val intent = Intent(context, StadiumNotificationReceiver::class.java)
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            2002,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+        )
+
+        val calendar = Calendar.getInstance().apply {
+            timeInMillis = System.currentTimeMillis()
+            set(Calendar.HOUR_OF_DAY, 11) // 11:00 AM daily
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            if (before(Calendar.getInstance())) {
+                add(Calendar.DAY_OF_MONTH, 1)
+            }
+        }
+
+        try {
+            alarmManager.setInexactRepeating(
+                AlarmManager.RTC_WAKEUP,
+                calendar.timeInMillis,
+                AlarmManager.INTERVAL_DAY,
+                pendingIntent
+            )
+        } catch (_: Exception) {}
+    }
+}

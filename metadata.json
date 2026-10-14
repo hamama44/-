@@ -1,0 +1,6 @@
+{
+  "name": "ملعب التحدي",
+  "description": "تطبيق تحديات كرة القدم الشامل: تحدي الثلاثين، صباحو تحدي، العب مع سري، مسيرة اللاعب، صح أو غلط، وترتيب الأهداف",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
