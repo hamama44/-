@@ -299,5 +299,30 @@ data class PvPMatchState(
     val opponentSelectedOption: Int? = null,
     val roundTimer: Int = 12,
     val commentaryMessage: String = "المباراة انطلقت! أجب أسرع لتسجيل هدف ⚽",
-    val isMatchFinished: Boolean = false
+    val isMatchFinished: Boolean = false,
+    val isFriendlyMatch: Boolean = false,
+    val friendlyCode: String? = null
 )
+
+// Friendly Match & Friend Invite Models (نظام دعوة صديق ومواجهات ودية)
+data class FriendlyChallengeInfo(
+    val code: String,
+    val friendName: String,
+    val friendAvatar: String,
+    val friendClub: String,
+    val difficulty: GameDifficulty = GameDifficulty.MEDIUM,
+    val totalRounds: Int = 5,
+    val message: String = "جاهز لتحدي ناري وجهاً لوجه! 🔥"
+)
+
+data class FriendlyMatchHistoryItem(
+    val id: String,
+    val friendName: String,
+    val friendAvatar: String,
+    val userScore: Int,
+    val friendScore: Int,
+    val isWin: Boolean,
+    val challengeCode: String,
+    val timeAgo: String
+)
+

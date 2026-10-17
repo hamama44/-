@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -35,6 +36,7 @@ import com.example.ui.theme.*
 
 @Composable
 fun PvPScreen(viewModel: FootballGameViewModel) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val pvpState by viewModel.pvpState.collectAsState()
 
     Scaffold(
@@ -44,6 +46,8 @@ fun PvPScreen(viewModel: FootballGameViewModel) {
                 isSearching = pvpState.isSearching,
                 currentRound = pvpState.currentRound,
                 totalRounds = pvpState.totalRounds,
+                isFriendlyMatch = pvpState.isFriendlyMatch,
+                friendlyCode = pvpState.friendlyCode,
                 onBack = { viewModel.navigateBack() }
             )
         }
@@ -63,6 +67,15 @@ fun PvPScreen(viewModel: FootballGameViewModel) {
                     state = pvpState,
                     onOptionSelect = { viewModel.answerPvPQuestion(it) },
                     onRematch = { viewModel.rematchPvP() },
+                    onShareResult = {
+                        viewModel.shareMatchResult(
+                            context = context,
+                            oppName = pvpState.opponent.name,
+                            userScore = pvpState.user.score,
+                            oppScore = pvpState.opponent.score,
+                            isWin = pvpState.user.score > pvpState.opponent.score
+                        )
+                    },
                     onExit = { viewModel.navigateBack() }
                 )
             }
@@ -75,6 +88,8 @@ fun PvPTopBar(
     isSearching: Boolean,
     currentRound: Int,
     totalRounds: Int,
+    isFriendlyMatch: Boolean = false,
+    friendlyCode: String? = null,
     onBack: () -> Unit
 ) {
     Surface(
@@ -107,18 +122,18 @@ fun PvPTopBar(
 
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "⚔️", fontSize = 18.sp)
+                    Text(text = if (isFriendlyMatch) "🤝" else "⚔️", fontSize = 18.sp)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "المواجهة المباشرة (PvP)",
+                        text = if (isFriendlyMatch && friendlyCode != null) "مواجهة ودية [$friendlyCode]" else "المواجهة المباشرة (PvP)",
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color.White,
+                        color = if (isFriendlyMatch) GoldAccent else Color.White,
                         fontWeight = FontWeight.Bold
                     )
                 }
                 if (!isSearching) {
                     Text(
-                        text = "الجولة $currentRound من $totalRounds",
+                        text = if (isFriendlyMatch) "كلاسيكو الأصدقاء • الجولة $currentRound من $totalRounds" else "الجولة $currentRound من $totalRounds",
                         style = MaterialTheme.typography.labelSmall,
                         color = TrophyGold
                     )
@@ -238,6 +253,7 @@ fun PvPMatchView(
     state: PvPMatchState,
     onOptionSelect: (Int) -> Unit,
     onRematch: () -> Unit,
+    onShareResult: () -> Unit,
     onExit: () -> Unit
 ) {
     val scrollState = rememberScrollState()
@@ -398,7 +414,9 @@ fun PvPMatchView(
             PvPMatchFinishedCard(
                 user = state.user,
                 opponent = state.opponent,
+                isFriendlyMatch = state.isFriendlyMatch,
                 onRematch = onRematch,
+                onShareResult = onShareResult,
                 onExit = onExit
             )
         }
@@ -626,7 +644,9 @@ fun StadiumCommentaryCard(message: String) {
 fun PvPMatchFinishedCard(
     user: com.example.data.PvPPlayer,
     opponent: com.example.data.PvPPlayer,
+    isFriendlyMatch: Boolean = false,
     onRematch: () -> Unit,
+    onShareResult: () -> Unit,
     onExit: () -> Unit
 ) {
     val won = user.score > opponent.score
@@ -649,7 +669,13 @@ fun PvPMatchFinishedCard(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                text = if (won) "🏆 فوز ساحق في المواجهة!" else if (draw) "🤝 تعادل ملحمي!" else "💔 خسارة بشرف!",
+                text = if (won) {
+                    if (isFriendlyMatch) "🏆 فوز ساحق على صديقك!" else "🏆 فوز ساحق في المواجهة!"
+                } else if (draw) {
+                    "🤝 تعادل ملحمي!"
+                } else {
+                    if (isFriendlyMatch) "💔 تفوق صديقك هذه المرة!" else "💔 خسارة بشرف!"
+                },
                 style = MaterialTheme.typography.headlineSmall,
                 color = if (won) TrophyGold else if (draw) EmeraldNeon else CardRed,
                 fontWeight = FontWeight.Black
@@ -674,6 +700,28 @@ fun PvPMatchFinishedCard(
             )
 
             Spacer(modifier = Modifier.height(20.dp))
+
+            if (isFriendlyMatch) {
+                OutlinedButton(
+                    onClick = onShareResult,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = GoldAccent),
+                    border = ButtonDefaults.outlinedButtonBorder.copy(
+                        brush = Brush.horizontalGradient(listOf(GoldAccent.copy(alpha = 0.5f), GoldAccent.copy(alpha = 0.5f)))
+                    )
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null, tint = GoldAccent, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "مشاركة نتيجة التحدي مع صديقك 📲",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+            }
 
             EmeraldButton(
                 text = "مواجهة جديدة فوراً (Rematch) ⚔️",

@@ -1,15 +1,36 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.StadiumAudioEffects
 import com.example.data.*
+import com.example.data.room.CumulativePlayerStat
+import com.example.data.room.GameHighScoreStat
+import com.example.data.room.OfflineRepository
+import com.example.data.room.OfflineSyncResult
+import com.example.data.room.PartyLeaderboardRecordEntity
+import com.example.data.daily.DailyChallenge
+import com.example.data.daily.DailyChallengeManager
+import com.example.data.ai.GeminiSpeechAuditor
+import com.example.data.ai.AiSpeechEvaluation
+import com.example.data.ai.AiTabooEvaluation
+import com.example.data.ai.AiSpokenAnswerEvaluation
+import com.example.data.voice.VoicePermissionRepository
+import com.example.data.voice.VoicePermissionStatus
+import com.example.data.voice.SpeechToTextManager
+import com.example.data.voice.SpeechState
+import com.example.notifications.StadiumNotificationManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 sealed class GameScreen {
@@ -25,13 +46,543 @@ sealed class GameScreen {
     object LeaderboardScreen : GameScreen()
     object ProfileScreen : GameScreen()
     object PvPMatchScreen : GameScreen()
+    object FriendInviteScreen : GameScreen()
+    object AutobusCompleteScreen : GameScreen()
+    object FiveSecondsScreen : GameScreen()
+    object WouldYouRatherScreen : GameScreen()
+    object GeneralRiddlesScreen : GameScreen()
+    object BedoonKalamScreen : GameScreen()
+    object TabooScreen : GameScreen()
+    object ProverbsScreen : GameScreen()
+    object MillionaireScreen : GameScreen()
+    object FourCluesScreen : GameScreen()
+    object PassAndPlayScreen : GameScreen()
+    object FootballTicTacToeScreen : GameScreen()
+    object FootballAuctionScreen : GameScreen()
+    object MissingXIScreen : GameScreen()
+    object OddOneOutScreen : GameScreen()
+    object JerseyAndTransfersScreen : GameScreen()
+    object SpyGameScreen : GameScreen()
+    object TruthOrDareScreen : GameScreen()
+    object ThirtySecondsRoundsScreen : GameScreen()
+    object SupabaseOnlineScreen : GameScreen()
 }
 
 class FootballGameViewModel(application: Application) : AndroidViewModel(application) {
     val repository = FootballRepository(application)
     val audioEffects = StadiumAudioEffects(application)
+    val offlineRepository = OfflineRepository(application, repository)
+    val dailyChallengeManager = DailyChallengeManager(application)
+    val voicePermissionRepository = VoicePermissionRepository(application)
+    val speechToTextManager = SpeechToTextManager(application)
+
+    private val _dailyChallenge = MutableStateFlow(dailyChallengeManager.getTodayChallenge())
+    val dailyChallenge: StateFlow<DailyChallenge> = _dailyChallenge.asStateFlow()
+
+    private val _isDailyReminderEnabled = MutableStateFlow(dailyChallengeManager.isReminderEnabled())
+    val isDailyReminderEnabled: StateFlow<Boolean> = _isDailyReminderEnabled.asStateFlow()
+
+    // -------------------------------------------------------------------------
+    // MICROPHONE PERMISSIONS & SPEECH-TO-TEXT ENGINE
+    // -------------------------------------------------------------------------
+    val voicePermissionStatus: StateFlow<VoicePermissionStatus> = voicePermissionRepository.permissionStatus
+    val isVoiceGamingEnabled: StateFlow<Boolean> = voicePermissionRepository.isVoiceGamingEnabled
+    val speechState: StateFlow<SpeechState> = speechToTextManager.speechState
+    val livePartialSpokenText: StateFlow<String> = speechToTextManager.partialText
+    val liveSoundLevel: StateFlow<Float> = speechToTextManager.soundLevel
+
+    fun onMicPermissionResult(granted: Boolean) {
+        voicePermissionRepository.onPermissionResult(granted)
+    }
+
+    fun startListeningForVoice(
+        language: String = "ar-SA",
+        prompt: String = "تحدث الآن في ملعب التحدي 🎙️⚽"
+    ) {
+        speechToTextManager.startListening(language, prompt)
+    }
+
+    fun stopListeningForVoice() {
+        speechToTextManager.stopListening()
+    }
+
+    fun cancelListeningForVoice() {
+        speechToTextManager.cancelListening()
+    }
+
+    // -------------------------------------------------------------------------
+    // AI SPEECH & ANSWER AUDITOR (تدقيق الذكاء الاصطناعي والكلام)
+    // -------------------------------------------------------------------------
+    private val _aiIsAuditing = MutableStateFlow(false)
+    val aiIsAuditing: StateFlow<Boolean> = _aiIsAuditing.asStateFlow()
+
+    private val _aiAuditFeedback = MutableStateFlow<String?>(null)
+    val aiAuditFeedback: StateFlow<String?> = _aiAuditFeedback.asStateFlow()
+
+    private val _aiAuditedItems = MutableStateFlow<List<String>>(emptyList())
+    val aiAuditedItems: StateFlow<List<String>> = _aiAuditedItems.asStateFlow()
+
+    private val _lastSpokenAnswerEvaluation = MutableStateFlow<AiSpokenAnswerEvaluation?>(null)
+    val lastSpokenAnswerEvaluation: StateFlow<AiSpokenAnswerEvaluation?> = _lastSpokenAnswerEvaluation.asStateFlow()
+
+    fun clearAiFeedback() {
+        _aiAuditFeedback.value = null
+        _aiAuditedItems.value = emptyList()
+        _lastSpokenAnswerEvaluation.value = null
+    }
+
+    fun clearSpokenAnswerEvaluation() {
+        _lastSpokenAnswerEvaluation.value = null
+    }
+
+    fun refreshDailyChallenge() {
+        _dailyChallenge.value = dailyChallengeManager.getTodayChallenge()
+    }
+
+    fun rerollDailyChallenge() {
+        audioEffects.playClick()
+        _dailyChallenge.value = dailyChallengeManager.rerollChallenge()
+    }
+
+    fun claimDailyChallengeReward() {
+        val reward = dailyChallengeManager.claimReward()
+        if (reward != null) {
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(
+                earnedPoints = reward.first,
+                earnedCoins = reward.second,
+                gameTitle = "مكافأة إتمام تحدي اليوم 🎯"
+            )
+            _dailyChallenge.value = dailyChallengeManager.getTodayChallenge()
+        }
+    }
+
+    fun toggleDailyReminder(enabled: Boolean) {
+        audioEffects.playClick()
+        _isDailyReminderEnabled.value = enabled
+        dailyChallengeManager.setReminderEnabled(enabled)
+    }
+
+    fun sendTestDailyNotification() {
+        audioEffects.playClick()
+        val ch = _dailyChallenge.value
+        StadiumNotificationManager(getApplication()).showDailyChallengeReminderNow(
+            challengeTitle = ch.title,
+            gameName = ch.gameTitle,
+            targetDesc = ch.goalDescription
+        )
+    }
+
+    fun launchChallengeGame(challenge: DailyChallenge) {
+        audioEffects.playClick()
+        when (challenge.gameTypeTag) {
+            "autobus" -> startAutobusGame()
+            "five_seconds" -> startFiveSecondsGame()
+            "taboo" -> startTabooGame()
+            "bedoon_kalam" -> startBedoonKalam()
+            "proverbs" -> startProverbsGame()
+            "millionaire" -> startMillionaireGame()
+            "four_clues" -> startFourCluesGame()
+            "sabaho" -> startSabahoChallenge()
+            "thirty_sec" -> startThirtySecondsQuiz()
+            "tictactoe" -> navigateTo(GameScreen.FootballTicTacToeScreen)
+            "auction" -> navigateTo(GameScreen.FootballAuctionScreen)
+            "missing_xi" -> navigateTo(GameScreen.MissingXIScreen)
+            "odd_one_out" -> navigateTo(GameScreen.OddOneOutScreen)
+            "jersey_transfers" -> navigateTo(GameScreen.JerseyAndTransfersScreen)
+            "spy" -> navigateTo(GameScreen.SpyGameScreen)
+            "truth_or_dare" -> navigateTo(GameScreen.TruthOrDareScreen)
+            "nasouh_rounds" -> navigateTo(GameScreen.ThirtySecondsRoundsScreen)
+            else -> navigateTo(GameScreen.Home)
+        }
+    }
+
+    fun auditFiveSecondsSpeech(spokenText: String) {
+        if (spokenText.isBlank()) return
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val prompt = _fiveSecondsPromptState.value.prompt
+            val result = GeminiSpeechAuditor.auditFiveSecondsChallenge(prompt, spokenText)
+            _aiIsAuditing.value = false
+            _aiAuditFeedback.value = result.feedback
+            _aiAuditedItems.value = result.detectedItems
+
+            if (result.isValid) {
+                _fiveSecondsCount.value = 3
+                _fiveSecondsIsRunning.value = false
+                fiveSecondsTimerJob?.cancel()
+                _fiveSecondsRoundFinished.value = true
+                _fiveSecondsSuccess.value = true
+                _fiveSecondsScore.value += 1
+                audioEffects.playVictory()
+                repository.addPointsAndCoins(50, 20)
+                recordPartyGameScore(
+                    "تحدي الـ 5 ثواني",
+                    "party",
+                    50,
+                    "إجابة صوتية دقيقة بالمايك والذكاء الاصطناعي (${result.detectedItems.joinToString("، ")}) 🎙️🤖"
+                )
+            } else {
+                audioEffects.playWrong()
+            }
+        }
+    }
+
+    fun auditTabooSpeech(spokenText: String) {
+        if (spokenText.isBlank()) return
+        val currentCard = _tabooCurrent.value
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val result = GeminiSpeechAuditor.auditTabooSpeech(
+                mainWord = currentCard.mainWord,
+                forbiddenWords = currentCard.forbiddenWords,
+                spokenDescription = spokenText
+            )
+            _aiIsAuditing.value = false
+            _aiAuditFeedback.value = result.feedback
+
+            if (result.isViolation) {
+                audioEffects.playWrong()
+                _tabooPenalties.value += 1
+            } else if (result.isSmartDescription) {
+                audioEffects.playVictory()
+                _tabooScore.value += 1
+                repository.addPointsAndCoins(25, 10)
+                recordPartyGameScore(
+                    "التابو العربي",
+                    "party",
+                    25,
+                    "شرح صوتي خالٍ من المحظورات (${currentCard.mainWord}) تدقيق الذكاء الاصطناعي 🎙️🤖"
+                )
+            }
+        }
+    }
+
+    fun auditAutobusVoiceInput(type: AutobusFieldType, spokenText: String) {
+        if (spokenText.isBlank()) return
+        val letter = _autobusLetter.value.letter
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val result = GeminiSpeechAuditor.auditAutobusVoice(letter, type.titleArabic, spokenText)
+            _aiIsAuditing.value = false
+            _aiAuditFeedback.value = result.feedback
+
+            if (result.isValid) {
+                updateAutobusAnswer(type, result.cleanedWord)
+                audioEffects.playCorrect()
+            } else {
+                audioEffects.playWrong()
+            }
+        }
+    }
+
+    /**
+     * Audits a spoken answer against a target word or answer using Gemini AI
+     * with high-precision local Arabic NLP fallback.
+     */
+    fun auditSpokenAnswerAgainstTarget(
+        expectedWordOrAnswer: String,
+        spokenAnswer: String,
+        questionOrContext: String = "",
+        acceptableSynonyms: List<String> = emptyList(),
+        onResult: ((AiSpokenAnswerEvaluation) -> Unit)? = null
+    ) {
+        if (spokenAnswer.isBlank()) return
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val evaluation = GeminiSpeechAuditor.auditSpokenAnswerAgainstTarget(
+                expectedWordOrAnswer = expectedWordOrAnswer,
+                spokenAnswer = spokenAnswer,
+                questionOrContext = questionOrContext,
+                acceptableSynonyms = acceptableSynonyms
+            )
+            _aiIsAuditing.value = false
+            _lastSpokenAnswerEvaluation.value = evaluation
+            _aiAuditFeedback.value = evaluation.feedback
+
+            if (evaluation.isCorrect) {
+                audioEffects.playVictory()
+            } else {
+                audioEffects.playWrong()
+            }
+            onResult?.invoke(evaluation)
+        }
+    }
+
+    /**
+     * Spoken Guess for Taboo:
+     * When teammate speaks the guessed word into the mic, Gemini AI validates
+     * if it matches currentCard.mainWord (handles synonyms, dialects, phonetic variations).
+     */
+    fun auditTabooSpokenGuess(spokenGuess: String) {
+        if (spokenGuess.isBlank()) return
+        val currentCard = _tabooCurrent.value
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val evaluation = GeminiSpeechAuditor.auditSpokenAnswerAgainstTarget(
+                expectedWordOrAnswer = currentCard.mainWord,
+                spokenAnswer = spokenGuess,
+                questionOrContext = "تخمين الكلمة المطلوبة في لعبة التابو العربي - قسم ${currentCard.category}"
+            )
+            _aiIsAuditing.value = false
+            _lastSpokenAnswerEvaluation.value = evaluation
+            _aiAuditFeedback.value = evaluation.feedback
+
+            if (evaluation.isCorrect) {
+                audioEffects.playVictory()
+                _tabooScore.value += 1
+                repository.addPointsAndCoins(35, 15)
+                recordPartyGameScore(
+                    "التابو العربي",
+                    "party",
+                    35,
+                    "تخمين صوتي ذكي للكلمة (${currentCard.mainWord}) تدقيق الذكاء الاصطناعي 🎙️🎯"
+                )
+                nextTabooCard()
+            } else {
+                audioEffects.playWrong()
+            }
+        }
+    }
+
+    /**
+     * Spoken answer for Trivia and Questions:
+     * Validates spoken voice answers against correct questions.
+     */
+    fun auditQuestionVoiceAnswer(
+        question: String,
+        correctAnswer: String,
+        spokenAnswer: String,
+        acceptableSynonyms: List<String> = emptyList(),
+        onSuccess: () -> Unit
+    ) {
+        if (spokenAnswer.isBlank()) return
+        viewModelScope.launch {
+            _aiIsAuditing.value = true
+            audioEffects.playTick()
+            val evaluation = GeminiSpeechAuditor.auditSpokenAnswerAgainstTarget(
+                expectedWordOrAnswer = correctAnswer,
+                spokenAnswer = spokenAnswer,
+                questionOrContext = question,
+                acceptableSynonyms = acceptableSynonyms
+            )
+            _aiIsAuditing.value = false
+            _lastSpokenAnswerEvaluation.value = evaluation
+            _aiAuditFeedback.value = evaluation.feedback
+
+            if (evaluation.isCorrect) {
+                audioEffects.playVictory()
+                onSuccess()
+            } else {
+                audioEffects.playWrong()
+            }
+        }
+    }
 
     val userProfile: StateFlow<UserProfile> = repository.userProfile
+    val isOfflineMode: StateFlow<Boolean> = offlineRepository.isOfflineMode
+    val isSyncing: StateFlow<Boolean> = offlineRepository.isSyncing
+    val pendingSyncCount: StateFlow<Int> = offlineRepository.pendingSyncCount
+    val cachedOfflineQuestionsCount: StateFlow<Int> = offlineRepository.cachedQuestionCount
+    val lastSyncResult: StateFlow<OfflineSyncResult?> = offlineRepository.lastSyncResult
+
+    private val _showOfflineDialog = MutableStateFlow(false)
+    val showOfflineDialog: StateFlow<Boolean> = _showOfflineDialog.asStateFlow()
+
+    fun setShowOfflineDialog(show: Boolean) {
+        audioEffects.playClick()
+        _showOfflineDialog.value = show
+    }
+
+    fun toggleOfflineMode() {
+        audioEffects.playClick()
+        offlineRepository.toggleOfflineMode()
+    }
+
+    fun syncOfflineRecords() {
+        audioEffects.playWhistle()
+        viewModelScope.launch {
+            val result = offlineRepository.syncPendingRecords()
+            if (result.syncedCount > 0) {
+                audioEffects.playCorrect()
+            }
+        }
+    }
+
+    fun dismissLastSyncResult() {
+        offlineRepository.dismissLastSyncResult()
+    }
+
+    // =========================================================================
+    // ROOM PERSISTENCE: CUMULATIVE PARTY & GATHERING LEADERBOARD
+    // =========================================================================
+    private val _leaderboardCategoryFilter = MutableStateFlow("all") // "all", "party", "football"
+    val leaderboardCategoryFilter: StateFlow<String> = _leaderboardCategoryFilter.asStateFlow()
+
+    private val _leaderboardTab = MutableStateFlow(0) // 0: الترتيب التراكمي, 1: الأرقام القياسية, 2: سجل المباريات
+    val leaderboardTab: StateFlow<Int> = _leaderboardTab.asStateFlow()
+
+    fun setLeaderboardCategoryFilter(filter: String) {
+        audioEffects.playClick()
+        _leaderboardCategoryFilter.value = filter
+    }
+
+    fun setLeaderboardTab(tab: Int) {
+        audioEffects.playClick()
+        _leaderboardTab.value = tab
+    }
+
+    val cumulativePartyLeaderboard: StateFlow<List<CumulativePlayerStat>> =
+        combine(offlineRepository.observeAllPartyRecords(), _leaderboardCategoryFilter) { records, filter ->
+            val user = repository.userProfile.value
+            val filtered = if (filter == "all") records else records.filter { it.category == filter }
+            filtered.groupBy { it.playerName }.map { (name, playerRecords) ->
+                val total = playerRecords.sumOf { it.score }
+                val count = playerRecords.size
+                val maxScore = playerRecords.maxOfOrNull { it.score } ?: 0
+                val favGame = playerRecords.groupBy { it.gameType }
+                    .maxByOrNull { it.value.size }?.key ?: "ألعاب الصالون"
+                val avatar = playerRecords.firstOrNull()?.playerAvatar ?: "👤"
+                val isCurrent = name.trim().equals(user.playerName.trim(), ignoreCase = true)
+
+                CumulativePlayerStat(
+                    playerName = name,
+                    playerAvatar = avatar,
+                    totalScore = total,
+                    gamesPlayedCount = count,
+                    highestScore = maxScore,
+                    favoriteGame = favGame,
+                    isCurrentUser = isCurrent
+                )
+            }.sortedByDescending { it.totalScore }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val gameHighScores: StateFlow<List<GameHighScoreStat>> =
+        offlineRepository.observeGameHighScores()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val allPartyRecords: StateFlow<List<PartyLeaderboardRecordEntity>> =
+        offlineRepository.observeAllPartyRecords()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun recordPartyGameScore(gameType: String, category: String, score: Int, details: String = "") {
+        val user = userProfile.value
+        viewModelScope.launch {
+            offlineRepository.recordPartyGameScore(
+                playerName = user.playerName,
+                playerAvatar = user.avatarEmoji,
+                gameType = gameType,
+                category = category,
+                score = score,
+                details = details
+            )
+            val newlyCompleted = dailyChallengeManager.reportGameScore(gameType, score)
+            _dailyChallenge.value = dailyChallengeManager.getTodayChallenge()
+            if (newlyCompleted) {
+                audioEffects.playVictory()
+            }
+        }
+    }
+
+    fun addManualPartyRecord(
+        playerName: String,
+        playerAvatar: String,
+        gameType: String,
+        category: String,
+        score: Int,
+        details: String
+    ) {
+        audioEffects.playVictory()
+        viewModelScope.launch {
+            offlineRepository.recordPartyGameScore(
+                playerName = playerName,
+                playerAvatar = playerAvatar,
+                gameType = gameType,
+                category = category,
+                score = score,
+                details = details
+            )
+            val newlyCompleted = dailyChallengeManager.reportGameScore(gameType, score)
+            _dailyChallenge.value = dailyChallengeManager.getTodayChallenge()
+            if (newlyCompleted) {
+                audioEffects.playVictory()
+            }
+        }
+    }
+
+    fun resetPartyLeaderboard() {
+        audioEffects.playWhistle()
+        viewModelScope.launch {
+            offlineRepository.resetPartyLeaderboardWithPresets()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // FRIEND INVITE & CHALLENGE CODES (دعوة صديق ومواجهات ودية)
+    // -------------------------------------------------------------------------
+    private val _userChallengeCode = MutableStateFlow(generateChallengeCode())
+    val userChallengeCode: StateFlow<String> = _userChallengeCode.asStateFlow()
+
+    private val _enteredFriendCode = MutableStateFlow("")
+    val enteredFriendCode: StateFlow<String> = _enteredFriendCode.asStateFlow()
+
+    private val _friendlyFriendsList = MutableStateFlow(defaultPresetFriends())
+    val friendlyFriendsList: StateFlow<List<FriendlyChallengeInfo>> = _friendlyFriendsList.asStateFlow()
+
+    private val _friendlyMatchHistory = MutableStateFlow(defaultFriendlyHistory())
+    val friendlyMatchHistory: StateFlow<List<FriendlyMatchHistoryItem>> = _friendlyMatchHistory.asStateFlow()
+
+    fun generateNewChallengeCode() {
+        audioEffects.playClick()
+        _userChallengeCode.value = generateChallengeCode()
+    }
+
+    fun setEnteredFriendCode(code: String) {
+        _enteredFriendCode.value = code.trim().uppercase()
+    }
+
+    fun shareChallengeCode(context: Context) {
+        audioEffects.playClick()
+        val code = _userChallengeCode.value
+        val shareText = """
+            ⚽🔥 تحداني الآن في تطبيق 'ملعب التحدي'!
+            رمز المواجهة الودية الخاص بي هو: $code
+            أدخل الرمز في وضع المواجهة الودية لنلعب وجهاً لوجه ونرى من هو كابتن الملعب الحقيقي! 🏆
+        """.trimIndent()
+
+        val sendIntent = Intent().apply {
+            action = Intent.ACTION_SEND
+            putExtra(Intent.EXTRA_TEXT, shareText)
+            type = "text/plain"
+        }
+        val shareIntent = Intent.createChooser(sendIntent, "مشاركة رمز التحدي الودي 📲")
+        shareIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(shareIntent)
+    }
+
+    fun shareMatchResult(context: Context, oppName: String, userScore: Int, oppScore: Int, isWin: Boolean) {
+        audioEffects.playClick()
+        val resultText = if (isWin) {
+            "🏆🔥 حققت فوزاً تاريخياً على كابتن $oppName بنتيجة $userScore - $oppScore في المواجهة الودية بـ 'ملعب التحدي'!"
+        } else if (userScore == oppScore) {
+            "🤝 تعادل ملحمي ومباراة نارية ضد كابتن $oppName بنتيجة $userScore - $oppScore في 'ملعب التحدي'!"
+        } else {
+            "⚽ انتهت مباراة ودية رائعة ضد كابتن $oppName بنتيجة $userScore - $oppScore في 'ملعب التحدي'! القادم أفضل! 💪"
+        }
+        val sendIntent = Intent().apply {
+            action = Intent.ACTION_SEND
+            putExtra(Intent.EXTRA_TEXT, resultText)
+            type = "text/plain"
+        }
+        val shareIntent = Intent.createChooser(sendIntent, "مشاركة نتيجة المواجهة الودية 📲")
+        shareIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(shareIntent)
+    }
 
     private val _currentScreen = MutableStateFlow<GameScreen>(GameScreen.Home)
     val currentScreen: StateFlow<GameScreen> = _currentScreen.asStateFlow()
@@ -171,8 +722,21 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         tsTimerJob?.cancel()
         audioEffects.playWhistle()
         val earnedScore = _tsScore.value
-        repository.addPointsAndCoins(earnedPoints = earnedScore * 15, earnedCoins = earnedScore * 5)
+        val points = earnedScore * 15
+        val coins = earnedScore * 5
+        repository.addPointsAndCoins(earnedPoints = points, earnedCoins = coins, gameTitle = "تحدي الثلاثين ثانية")
         repository.updateThirtySecondsHighScore(earnedScore)
+
+        if (isOfflineMode.value) {
+            viewModelScope.launch {
+                offlineRepository.recordOfflineGamePlayed(
+                    gameType = "تحدي الـ 30 ثانية",
+                    score = earnedScore,
+                    earnedPoints = points,
+                    earnedCoins = coins
+                )
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -379,10 +943,24 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
             _sabahoGameOver.value = true
             sabahoTimerJob?.cancel()
             audioEffects.playWhistle()
+            val points = _sabahoScore.value * 2
+            val coins = (_sabahoScore.value * 0.8).toInt()
             repository.addPointsAndCoins(
-                earnedPoints = _sabahoScore.value * 2,
-                earnedCoins = (_sabahoScore.value * 0.8).toInt()
+                earnedPoints = points,
+                earnedCoins = coins,
+                gameTitle = "صباحو تحدي"
             )
+
+            if (isOfflineMode.value) {
+                viewModelScope.launch {
+                    offlineRepository.recordOfflineGamePlayed(
+                        gameType = "صباحو تحدي",
+                        score = _sabahoScore.value,
+                        earnedPoints = points,
+                        earnedCoins = coins
+                    )
+                }
+            }
         }
     }
 
@@ -645,6 +1223,16 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun nextEventChallenge() {
+        audioEffects.playClick()
+        if (_eventChallengeIndex.value + 1 < _eventChallenges.value.size) {
+            _eventChallengeIndex.value += 1
+            loadEventOrderChallenge(_eventChallenges.value[_eventChallengeIndex.value])
+        } else {
+            navigateBack()
+        }
+    }
+
     // -------------------------------------------------------------------------
     // DIFFICULTY SELECTION COMPONENT (سهل / متوسط / صعب)
     // -------------------------------------------------------------------------
@@ -682,7 +1270,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         when (target) {
             is GameScreen.ThirtySecondsSelect -> navigateTo(GameScreen.ThirtySecondsSelect)
             is GameScreen.ThirtySecondsQuiz -> startThirtySecondsQuiz()
-            is GameScreen.ThirtySecondsPlayers -> startPlayerMentionMode()
+            is GameScreen.ThirtySecondsPlayers -> startPlayerMentionChallenge()
             is GameScreen.Sabaho -> startSabahoChallenge()
             is GameScreen.MysteryPlayerScreen -> startMysteryPlayerGame()
             is GameScreen.CareerPathScreen -> startCareerChallenge()
@@ -710,7 +1298,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
     fun startPvPMatchSearch() {
         audioEffects.playWhistle()
-        val user = _userProfile.value
+        val user = userProfile.value
         val userPvP = PvPPlayer(
             name = user.playerName,
             avatarEmoji = user.avatarEmoji,
@@ -896,11 +1484,44 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         val earnedPoints = if (won) 120 else if (draw) 50 else 25
         val earnedCoins = if (won) 60 else if (draw) 25 else 10
 
+        val title = if (current.isFriendlyMatch && current.friendlyCode != null) {
+            "مواجهة ودية [رمز: ${current.friendlyCode}]"
+        } else {
+            "المواجهة المباشرة PvP"
+        }
+
         repository.addPointsAndCoins(
             earnedPoints = earnedPoints,
             earnedCoins = earnedCoins,
-            gameTitle = "المواجهة المباشرة PvP"
+            gameTitle = title
         )
+
+        // Save friendly match history
+        if (current.isFriendlyMatch && current.friendlyCode != null) {
+            val newHistoryItem = FriendlyMatchHistoryItem(
+                id = "fm_${System.currentTimeMillis()}",
+                friendName = current.opponent.name,
+                friendAvatar = current.opponent.avatarEmoji,
+                userScore = userScore,
+                friendScore = oppScore,
+                isWin = won,
+                challengeCode = current.friendlyCode,
+                timeAgo = "الآن"
+            )
+            _friendlyMatchHistory.value = listOf(newHistoryItem) + _friendlyMatchHistory.value
+        }
+
+        // Record to local Room database if offline mode
+        if (isOfflineMode.value) {
+            viewModelScope.launch {
+                offlineRepository.recordOfflineGamePlayed(
+                    gameType = title,
+                    score = userScore,
+                    earnedPoints = earnedPoints,
+                    earnedCoins = earnedCoins
+                )
+            }
+        }
 
         if (won) {
             audioEffects.playWhistle()
@@ -909,9 +1530,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         }
 
         val finalCommentary = when {
-            won -> "🏆 فوز تاريخي ساحق لـ ${current.user.name} في كلاسيكو المواجهة المباشرة!"
+            won -> if (current.isFriendlyMatch) "🏆 فوز ساحق لـ ${current.user.name} على صديقه ${current.opponent.name}!" else "🏆 فوز تاريخي ساحق لـ ${current.user.name} في كلاسيكو المواجهة المباشرة!"
             draw -> "🤝 مباراة ملحمية تنتهي بتعادل الفريقين واقتسام النقاط!"
-            else -> "💔 خسر كابتن الملعب بفارق ضئيل، حظاً أوفر في المواجهة القادمة!"
+            else -> if (current.isFriendlyMatch) "💔 تفوق الصديق ${current.opponent.name} بفارق ضئيل، حظاً أوفر في الجولة القادمة!" else "💔 خسر كابتن الملعب بفارق ضئيل، حظاً أوفر في المواجهة القادمة!"
         }
 
         _pvpState.value = current.copy(
@@ -920,17 +1541,1166 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         )
     }
 
+    fun startFriendlyMatch(code: String, customOpponent: FriendlyChallengeInfo? = null) {
+        audioEffects.playWhistle()
+        val user = userProfile.value
+        val userPvP = PvPPlayer(
+            name = user.playerName,
+            avatarEmoji = user.avatarEmoji,
+            club = user.favoriteClub,
+            score = 0
+        )
+        val cleanCode = code.trim().uppercase()
+        val opponentInfo = customOpponent
+            ?: _friendlyFriendsList.value.firstOrNull { it.code.equals(cleanCode, ignoreCase = true) }
+            ?: FriendlyChallengeInfo(
+                code = cleanCode,
+                friendName = "صديق التحدي ($cleanCode)",
+                friendAvatar = "🤝",
+                friendClub = "فريق الأصدقاء",
+                difficulty = _selectedDifficulty.value
+            )
+
+        val oppPvP = PvPPlayer(
+            name = opponentInfo.friendName,
+            avatarEmoji = opponentInfo.friendAvatar,
+            club = opponentInfo.friendClub,
+            score = 0
+        )
+
+        _pvpState.value = PvPMatchState(
+            isSearching = true,
+            currentRound = 1,
+            totalRounds = 5,
+            user = userPvP,
+            opponent = oppPvP,
+            currentQuestion = null,
+            roundTimer = 12,
+            commentaryMessage = "جاري الاتصال بغرفة المواجهة الودية برمز [$cleanCode]... 🤝",
+            isFriendlyMatch = true,
+            friendlyCode = cleanCode
+        )
+        navigateTo(GameScreen.PvPMatchScreen)
+
+        viewModelScope.launch {
+            delay(1800) // Simulated room join
+            pvpQuestions = repository.getPvPQuestions().shuffled().take(5)
+            if (pvpQuestions.isNotEmpty()) {
+                val q1 = pvpQuestions[0]
+                _pvpState.value = _pvpState.value.copy(
+                    isSearching = false,
+                    currentRound = 1,
+                    currentQuestion = q1,
+                    userSelectedOption = null,
+                    opponentSelectedOption = null,
+                    roundTimer = 12,
+                    commentaryMessage = "صافرة البداية! انطلقت المواجهة الودية ضد ${oppPvP.name} ⚽"
+                )
+                startPvPRoundTimer()
+                scheduleOpponentAnswer(q1)
+            }
+        }
+    }
+
     fun rematchPvP() {
-        startPvPMatchSearch()
+        val current = _pvpState.value
+        if (current.isFriendlyMatch && current.friendlyCode != null) {
+            startFriendlyMatch(current.friendlyCode)
+        } else {
+            startPvPMatchSearch()
+        }
+    }
+
+    // =========================================================================
+    // 1. AUTOBUS COMPLETE (أتوبيس كومبليت)
+    // =========================================================================
+    private var autobusTimerJob: Job? = null
+    private var autobusAiJob: Job? = null
+
+    private val _autobusLetter = MutableStateFlow(PartyGamesRepository.getRandomLetter())
+    val autobusLetter: StateFlow<AutobusLetterData> = _autobusLetter.asStateFlow()
+
+    private val _autobusUserAnswers = MutableStateFlow(AutobusUserAnswers())
+    val autobusUserAnswers: StateFlow<AutobusUserAnswers> = _autobusUserAnswers.asStateFlow()
+
+    private val _autobusTimeLeft = MutableStateFlow(60)
+    val autobusTimeLeft: StateFlow<Int> = _autobusTimeLeft.asStateFlow()
+
+    private val _autobusIsRunning = MutableStateFlow(false)
+    val autobusIsRunning: StateFlow<Boolean> = _autobusIsRunning.asStateFlow()
+
+    private val _autobusIsFinished = MutableStateFlow(false)
+    val autobusIsFinished: StateFlow<Boolean> = _autobusIsFinished.asStateFlow()
+
+    private val _autobusRoundResult = MutableStateFlow<AutobusRoundResult?>(null)
+    val autobusRoundResult: StateFlow<AutobusRoundResult?> = _autobusRoundResult.asStateFlow()
+
+    private val _autobusAiProgress = MutableStateFlow(0)
+    val autobusAiProgress: StateFlow<Int> = _autobusAiProgress.asStateFlow()
+
+    private val _autobusTotalScore = MutableStateFlow(0)
+    val autobusTotalScore: StateFlow<Int> = _autobusTotalScore.asStateFlow()
+
+    private val _autobusRoundsCount = MutableStateFlow(1)
+    val autobusRoundsCount: StateFlow<Int> = _autobusRoundsCount.asStateFlow()
+
+    fun startAutobusGame(letter: Char? = null) {
+        audioEffects.playWhistle()
+        autobusTimerJob?.cancel()
+        autobusAiJob?.cancel()
+
+        val chosenLetter = if (letter != null) {
+            PartyGamesRepository.getLetterData(letter)
+        } else {
+            PartyGamesRepository.getRandomLetter()
+        }
+
+        _autobusLetter.value = chosenLetter
+        _autobusUserAnswers.value = AutobusUserAnswers()
+        _autobusTimeLeft.value = 60
+        _autobusIsRunning.value = true
+        _autobusIsFinished.value = false
+        _autobusRoundResult.value = null
+        _autobusAiProgress.value = 0
+
+        navigateTo(GameScreen.AutobusCompleteScreen)
+
+        autobusTimerJob = viewModelScope.launch {
+            while (_autobusTimeLeft.value > 0 && _autobusIsRunning.value) {
+                delay(1000)
+                if (_autobusIsRunning.value) {
+                    _autobusTimeLeft.value -= 1
+                    if (_autobusTimeLeft.value in 1..10) {
+                        audioEffects.playTick()
+                    }
+                }
+            }
+            if (_autobusIsRunning.value && _autobusTimeLeft.value <= 0) {
+                finishAutobusRound(isTimeUp = true)
+            }
+        }
+
+        autobusAiJob = viewModelScope.launch {
+            for (i in 1..8) {
+                delay((4000..7000).random().toLong())
+                if (!_autobusIsRunning.value) break
+                _autobusAiProgress.value = i
+                if (i == 8 && (1..3).random() == 1) {
+                    delay(3000)
+                    if (_autobusIsRunning.value) {
+                        finishAutobusRound(isAiCompletedFirst = true)
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    fun updateAutobusAnswer(type: AutobusFieldType, text: String) {
+        val current = _autobusUserAnswers.value
+        val updated = current.copy()
+        updated.setAnswer(type, text)
+        _autobusUserAnswers.value = updated
+    }
+
+    fun claimAutobusComplete() {
+        if (!_autobusIsRunning.value) return
+        audioEffects.playWhistle()
+        finishAutobusRound(isPlayerCompletedFirst = true)
+    }
+
+    private fun finishAutobusRound(
+        isTimeUp: Boolean = false,
+        isPlayerCompletedFirst: Boolean = false,
+        isAiCompletedFirst: Boolean = false
+    ) {
+        _autobusIsRunning.value = false
+        autobusTimerJob?.cancel()
+        autobusAiJob?.cancel()
+
+        val letterData = _autobusLetter.value
+        val answers = _autobusUserAnswers.value
+        val results = mutableListOf<AutobusFieldResult>()
+
+        val aiAnswers = listOf(
+            letterData.sampleBoy,
+            letterData.sampleGirl,
+            letterData.sampleAnimal,
+            letterData.samplePlant,
+            letterData.sampleObject,
+            letterData.sampleCountry,
+            letterData.sampleJob,
+            letterData.sampleFood
+        )
+
+        val categories = AutobusFieldType.values()
+        var roundScore = 0
+        var aiScore = 0
+
+        categories.forEachIndexed { index, cat ->
+            val userAns = answers.getAnswer(cat)
+            val aiAns = aiAnswers.getOrElse(index) { "" }
+            val evaluated = PartyGamesRepository.evaluateAutobusAnswer(
+                letter = letterData.letter,
+                category = cat,
+                userAnswerRaw = userAns,
+                aiAnswer = aiAns
+            )
+            results.add(evaluated)
+            roundScore += evaluated.scoreAwarded
+
+            val aiFilled = index < _autobusAiProgress.value || isAiCompletedFirst
+            if (aiFilled) {
+                aiScore += if (evaluated.scoreAwarded == 5) 5 else 10
+            }
+        }
+
+        if (isPlayerCompletedFirst) {
+            roundScore += 10
+        }
+
+        _autobusTotalScore.value += roundScore
+        val timeTaken = 60 - _autobusTimeLeft.value
+        _autobusRoundResult.value = AutobusRoundResult(
+            letter = letterData.letter,
+            totalScore = roundScore,
+            aiTotalScore = aiScore,
+            fieldResults = results,
+            timeTakenSeconds = timeTaken
+        )
+        _autobusIsFinished.value = true
+
+        if (roundScore > aiScore) {
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(roundScore * 5, roundScore / 2)
+        } else {
+            audioEffects.playCorrect()
+            repository.addPointsAndCoins(roundScore * 3, roundScore / 3)
+        }
+        recordPartyGameScore("أتوبيس كومبليت", "party", roundScore, "حرف ${letterData.letter} • نتيجة: $roundScore نقطة 🚌")
+
+        if (isOfflineMode.value) {
+            viewModelScope.launch {
+                offlineRepository.recordOfflineGamePlayed(
+                    gameType = "أتوبيس كومبليت (${letterData.letter})",
+                    score = roundScore,
+                    earnedPoints = roundScore * 5,
+                    earnedCoins = roundScore / 2
+                )
+            }
+        }
+    }
+
+    fun nextAutobusRound() {
+        _autobusRoundsCount.value += 1
+        startAutobusGame()
+    }
+
+    // =========================================================================
+    // 2. FIVE SECONDS CHALLENGE (تحدي الـ 5 ثواني)
+    // =========================================================================
+    private var fiveSecondsTimerJob: Job? = null
+
+    private val _fiveSecondsList = MutableStateFlow(PartyGamesRepository.fiveSecondsPrompts.shuffled())
+    private val _fiveSecondsIndex = MutableStateFlow(0)
+    private val _fiveSecondsPromptState = MutableStateFlow(PartyGamesRepository.fiveSecondsPrompts[0])
+    val fiveSecondsPromptState: StateFlow<FiveSecondsPrompt> = _fiveSecondsPromptState.asStateFlow()
+
+    private val _fiveSecondsTimeLeft = MutableStateFlow(5.0f)
+    val fiveSecondsTimeLeft: StateFlow<Float> = _fiveSecondsTimeLeft.asStateFlow()
+
+    private val _fiveSecondsCount = MutableStateFlow(0)
+    val fiveSecondsCount: StateFlow<Int> = _fiveSecondsCount.asStateFlow()
+
+    private val _fiveSecondsScore = MutableStateFlow(0)
+    val fiveSecondsScore: StateFlow<Int> = _fiveSecondsScore.asStateFlow()
+
+    private val _fiveSecondsIsRunning = MutableStateFlow(false)
+    val fiveSecondsIsRunning: StateFlow<Boolean> = _fiveSecondsIsRunning.asStateFlow()
+
+    private val _fiveSecondsRoundFinished = MutableStateFlow(false)
+    val fiveSecondsRoundFinished: StateFlow<Boolean> = _fiveSecondsRoundFinished.asStateFlow()
+
+    private val _fiveSecondsSuccess = MutableStateFlow(false)
+    val fiveSecondsSuccess: StateFlow<Boolean> = _fiveSecondsSuccess.asStateFlow()
+
+    fun startFiveSecondsGame() {
+        audioEffects.playClick()
+        val list = PartyGamesRepository.fiveSecondsPrompts.shuffled()
+        _fiveSecondsList.value = list
+        _fiveSecondsIndex.value = 0
+        _fiveSecondsScore.value = 0
+        _fiveSecondsPromptState.value = list[0]
+        _fiveSecondsCount.value = 0
+        _fiveSecondsTimeLeft.value = 5.0f
+        _fiveSecondsIsRunning.value = false
+        _fiveSecondsRoundFinished.value = false
+        _fiveSecondsSuccess.value = false
+        navigateTo(GameScreen.FiveSecondsScreen)
+    }
+
+    fun startFiveSecondsCountdown() {
+        if (_fiveSecondsIsRunning.value) return
+        audioEffects.playWhistle()
+        _fiveSecondsCount.value = 0
+        _fiveSecondsTimeLeft.value = 5.0f
+        _fiveSecondsIsRunning.value = true
+        _fiveSecondsRoundFinished.value = false
+        _fiveSecondsSuccess.value = false
+
+        fiveSecondsTimerJob?.cancel()
+        fiveSecondsTimerJob = viewModelScope.launch {
+            val totalSteps = 50
+            for (step in 1..totalSteps) {
+                delay(100)
+                if (!_fiveSecondsIsRunning.value) break
+                val remaining = 5.0f - (step * 0.1f)
+                _fiveSecondsTimeLeft.value = maxOf(0.0f, remaining)
+                if (remaining in 0.1f..2.0f && step % 3 == 0) {
+                    audioEffects.playTick()
+                }
+            }
+            if (_fiveSecondsIsRunning.value) {
+                _fiveSecondsIsRunning.value = false
+                _fiveSecondsRoundFinished.value = true
+                val success = _fiveSecondsCount.value >= 3
+                _fiveSecondsSuccess.value = success
+                if (success) {
+                    audioEffects.playVictory()
+                    _fiveSecondsScore.value += 1
+                    repository.addPointsAndCoins(30, 10)
+                } else {
+                    audioEffects.playWrong()
+                }
+            }
+        }
+    }
+
+    fun tapFiveSecondsCount() {
+        if (!_fiveSecondsIsRunning.value) return
+        val next = _fiveSecondsCount.value + 1
+        _fiveSecondsCount.value = next
+        audioEffects.playClick()
+        if (next >= 3) {
+            _fiveSecondsIsRunning.value = false
+            fiveSecondsTimerJob?.cancel()
+            _fiveSecondsRoundFinished.value = true
+            _fiveSecondsSuccess.value = true
+            _fiveSecondsScore.value += 1
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(30, 10)
+            recordPartyGameScore("تحدي الـ 5 ثواني", "party", 30, "3 إجابات في أقل من 5 ثوانٍ ⚡")
+
+            if (isOfflineMode.value) {
+                viewModelScope.launch {
+                    offlineRepository.recordOfflineGamePlayed(
+                        gameType = "تحدي الـ 5 ثواني",
+                        score = _fiveSecondsScore.value,
+                        earnedPoints = 30,
+                        earnedCoins = 10
+                    )
+                }
+            }
+        }
+    }
+
+    fun nextFiveSecondsPrompt() {
+        fiveSecondsTimerJob?.cancel()
+        val list = _fiveSecondsList.value
+        val nextIndex = (_fiveSecondsIndex.value + 1) % list.size
+        _fiveSecondsIndex.value = nextIndex
+        _fiveSecondsPromptState.value = list[nextIndex]
+        _fiveSecondsCount.value = 0
+        _fiveSecondsTimeLeft.value = 5.0f
+        _fiveSecondsIsRunning.value = false
+        _fiveSecondsRoundFinished.value = false
+        _fiveSecondsSuccess.value = false
+    }
+
+    // =========================================================================
+    // 3. WOULD YOU RATHER (لو خيروك؟)
+    // =========================================================================
+    private val _wyrList = MutableStateFlow(PartyGamesRepository.wouldYouRatherQuestions.shuffled())
+    private val _wyrIndex = MutableStateFlow(0)
+    private val _wyrPromptState = MutableStateFlow(PartyGamesRepository.wouldYouRatherQuestions[0])
+    val wouldYouRatherPromptState: StateFlow<WouldYouRatherQuestion> = _wyrPromptState.asStateFlow()
+
+    private val _wyrSelectedOption = MutableStateFlow<String?>(null)
+    val wouldYouRatherSelectedOption: StateFlow<String?> = _wyrSelectedOption.asStateFlow()
+
+    private val _wyrTotalAnswered = MutableStateFlow(0)
+    val wouldYouRatherTotalAnswered: StateFlow<Int> = _wyrTotalAnswered.asStateFlow()
+
+    fun startWouldYouRatherGame() {
+        audioEffects.playClick()
+        val list = PartyGamesRepository.wouldYouRatherQuestions.shuffled()
+        _wyrList.value = list
+        _wyrIndex.value = 0
+        _wyrPromptState.value = list[0]
+        _wyrSelectedOption.value = null
+        navigateTo(GameScreen.WouldYouRatherScreen)
+    }
+
+    fun selectWouldYouRatherOption(option: String) {
+        if (_wyrSelectedOption.value != null) return
+        _wyrSelectedOption.value = option
+        _wyrTotalAnswered.value += 1
+        audioEffects.playCorrect()
+        repository.addPointsAndCoins(15, 5)
+    }
+
+    fun nextWouldYouRatherQuestion() {
+        audioEffects.playClick()
+        val list = _wyrList.value
+        val nextIndex = (_wyrIndex.value + 1) % list.size
+        _wyrIndex.value = nextIndex
+        _wyrPromptState.value = list[nextIndex]
+        _wyrSelectedOption.value = null
+    }
+
+    // =========================================================================
+    // 4. GENERAL RIDDLES (فوازير وألغاز الذكاء)
+    // =========================================================================
+    private val _riddleList = MutableStateFlow(PartyGamesRepository.generalRiddles.shuffled())
+    private val _riddleIndex = MutableStateFlow(0)
+    private val _riddlePromptState = MutableStateFlow(PartyGamesRepository.generalRiddles[0])
+    val generalRiddlePromptState: StateFlow<GeneralRiddle> = _riddlePromptState.asStateFlow()
+
+    private val _riddleRevealedHints = MutableStateFlow(0)
+    val riddleRevealedHints: StateFlow<Int> = _riddleRevealedHints.asStateFlow()
+
+    private val _riddleUserGuess = MutableStateFlow("")
+    val riddleUserGuess: StateFlow<String> = _riddleUserGuess.asStateFlow()
+
+    private val _riddleIsSolved = MutableStateFlow(false)
+    val riddleIsSolved: StateFlow<Boolean> = _riddleIsSolved.asStateFlow()
+
+    private val _riddleFeedback = MutableStateFlow<String?>(null)
+    val riddleFeedback: StateFlow<String?> = _riddleFeedback.asStateFlow()
+
+    private val _riddleScore = MutableStateFlow(0)
+    val riddleScore: StateFlow<Int> = _riddleScore.asStateFlow()
+
+    fun startGeneralRiddlesGame() {
+        audioEffects.playClick()
+        val list = PartyGamesRepository.generalRiddles.shuffled()
+        _riddleList.value = list
+        _riddleIndex.value = 0
+        _riddlePromptState.value = list[0]
+        _riddleRevealedHints.value = 0
+        _riddleUserGuess.value = ""
+        _riddleIsSolved.value = false
+        _riddleFeedback.value = null
+        _riddleScore.value = 0
+        navigateTo(GameScreen.GeneralRiddlesScreen)
+    }
+
+    fun revealRiddleHint() {
+        val current = _riddleRevealedHints.value
+        val maxHints = _riddlePromptState.value.hints.size
+        if (current < maxHints) {
+            audioEffects.playClick()
+            _riddleRevealedHints.value = current + 1
+        }
+    }
+
+    fun setRiddleGuess(guess: String) {
+        _riddleUserGuess.value = guess
+    }
+
+    fun submitRiddleGuess() {
+        val guess = _riddleUserGuess.value.trim()
+        if (guess.isEmpty()) return
+        val current = _riddlePromptState.value
+
+        val isCorrect = current.acceptableAnswers.any { it.equals(guess, ignoreCase = true) } ||
+                guess.contains(current.answer, ignoreCase = true)
+
+        if (isCorrect) {
+            _riddleIsSolved.value = true
+            _riddleFeedback.value = "إجابة عبقرية! 🎉 ${current.funExplanation}"
+            val bonus = maxOf(10, 40 - (_riddleRevealedHints.value * 10))
+            _riddleScore.value += bonus
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(bonus, bonus / 2)
+
+            if (isOfflineMode.value) {
+                viewModelScope.launch {
+                    offlineRepository.recordOfflineGamePlayed(
+                        gameType = "فوازير الذكاء (${current.title})",
+                        score = _riddleScore.value,
+                        earnedPoints = bonus,
+                        earnedCoins = bonus / 2
+                    )
+                }
+            }
+        } else {
+            audioEffects.playWrong()
+            _riddleFeedback.value = "حاول مرة أخرى! 🤔 استخدم وسيلة مساعدة (تلميح) إذا احتجت"
+        }
+    }
+
+    fun giveUpAndShowRiddleAnswer() {
+        val current = _riddlePromptState.value
+        _riddleIsSolved.value = true
+        _riddleFeedback.value = "الحل الصحيح هو: ${current.answer} 💡 ${current.funExplanation}"
+        audioEffects.playWhistle()
+    }
+
+    fun nextRiddle() {
+        audioEffects.playClick()
+        val list = _riddleList.value
+        val nextIndex = (_riddleIndex.value + 1) % list.size
+        _riddleIndex.value = nextIndex
+        _riddlePromptState.value = list[nextIndex]
+        _riddleRevealedHints.value = 0
+        _riddleUserGuess.value = ""
+        _riddleIsSolved.value = false
+        _riddleFeedback.value = null
+    }
+
+    // =========================================================================
+    // 5. بدون كلام (CHARADES & EMOJI MOVIES / PROVERBS)
+    // =========================================================================
+    private var bedoonKalamTimerJob: Job? = null
+
+    private val _bedoonKalamMode = MutableStateFlow(BedoonKalamMode.EMOJI_GUESS)
+    val bedoonKalamMode: StateFlow<BedoonKalamMode> = _bedoonKalamMode.asStateFlow()
+
+    private val _bedoonKalamList = MutableStateFlow(ArabicGatheringGamesRepository.bedoonKalamItems.shuffled())
+    private val _bedoonKalamIndex = MutableStateFlow(0)
+    private val _bedoonKalamCurrent = MutableStateFlow(ArabicGatheringGamesRepository.bedoonKalamItems[0])
+    val bedoonKalamCurrent: StateFlow<BedoonKalamItem> = _bedoonKalamCurrent.asStateFlow()
+
+    private val _bedoonKalamTimeLeft = MutableStateFlow(60)
+    val bedoonKalamTimeLeft: StateFlow<Int> = _bedoonKalamTimeLeft.asStateFlow()
+
+    private val _bedoonKalamIsCardRevealed = MutableStateFlow(false)
+    val bedoonKalamIsCardRevealed: StateFlow<Boolean> = _bedoonKalamIsCardRevealed.asStateFlow()
+
+    private val _bedoonKalamRevealedHints = MutableStateFlow(0)
+    val bedoonKalamRevealedHints: StateFlow<Int> = _bedoonKalamRevealedHints.asStateFlow()
+
+    private val _bedoonKalamScore = MutableStateFlow(0)
+    val bedoonKalamScore: StateFlow<Int> = _bedoonKalamScore.asStateFlow()
+
+    private val _bedoonKalamSolved = MutableStateFlow(false)
+    val bedoonKalamSolved: StateFlow<Boolean> = _bedoonKalamSolved.asStateFlow()
+
+    private val _bedoonKalamFeedback = MutableStateFlow<String?>(null)
+    val bedoonKalamFeedback: StateFlow<String?> = _bedoonKalamFeedback.asStateFlow()
+
+    fun startBedoonKalam(mode: BedoonKalamMode = BedoonKalamMode.EMOJI_GUESS) {
+        audioEffects.playClick()
+        bedoonKalamTimerJob?.cancel()
+        val list = ArabicGatheringGamesRepository.bedoonKalamItems.shuffled()
+        _bedoonKalamMode.value = mode
+        _bedoonKalamList.value = list
+        _bedoonKalamIndex.value = 0
+        _bedoonKalamCurrent.value = list[0]
+        _bedoonKalamTimeLeft.value = if (mode == BedoonKalamMode.ACTING_CHARADES) 90 else 60
+        _bedoonKalamIsCardRevealed.value = false
+        _bedoonKalamRevealedHints.value = 0
+        _bedoonKalamScore.value = 0
+        _bedoonKalamSolved.value = false
+        _bedoonKalamFeedback.value = null
+        navigateTo(GameScreen.BedoonKalamScreen)
+        startBedoonKalamTimer()
+    }
+
+    private fun startBedoonKalamTimer() {
+        bedoonKalamTimerJob?.cancel()
+        bedoonKalamTimerJob = viewModelScope.launch {
+            while (_bedoonKalamTimeLeft.value > 0 && !_bedoonKalamSolved.value) {
+                delay(1000)
+                _bedoonKalamTimeLeft.value -= 1
+                if (_bedoonKalamTimeLeft.value in 1..10) {
+                    audioEffects.playTick()
+                }
+            }
+            if (_bedoonKalamTimeLeft.value <= 0 && !_bedoonKalamSolved.value) {
+                audioEffects.playWrong()
+                _bedoonKalamFeedback.value = "انتهى الوقت! الإجابة كانت: ${_bedoonKalamCurrent.value.title}"
+            }
+        }
+    }
+
+    fun revealBedoonKalamActingCard() {
+        audioEffects.playClick()
+        _bedoonKalamIsCardRevealed.value = true
+    }
+
+    fun revealBedoonKalamHint() {
+        val current = _bedoonKalamCurrent.value
+        if (_bedoonKalamRevealedHints.value < current.hints.size) {
+            audioEffects.playClick()
+            _bedoonKalamRevealedHints.value += 1
+        }
+    }
+
+    fun submitBedoonKalamAnswer(guess: String) {
+        val trimmed = guess.trim()
+        if (trimmed.isEmpty()) return
+        val current = _bedoonKalamCurrent.value
+
+        val isCorrect = current.acceptableAnswers.any { it.equals(trimmed, ignoreCase = true) } ||
+                trimmed.contains(current.title, ignoreCase = true)
+
+        if (isCorrect) {
+            _bedoonKalamSolved.value = true
+            bedoonKalamTimerJob?.cancel()
+            _bedoonKalamScore.value += 25
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(25, 10)
+            _bedoonKalamFeedback.value = "إجابة صحيحة وعبقرية! 🎉 (${current.title})"
+            recordPartyGameScore("بدون كلام", "party", 25, "تخمين ${current.category} (${current.title}) 🎭")
+
+            if (isOfflineMode.value) {
+                viewModelScope.launch {
+                    offlineRepository.recordOfflineGamePlayed(
+                        gameType = "بدون كلام (${current.category})",
+                        score = _bedoonKalamScore.value,
+                        earnedPoints = 25,
+                        earnedCoins = 10
+                    )
+                }
+            }
+        } else {
+            audioEffects.playWrong()
+            _bedoonKalamFeedback.value = "إجابة غير صحيحة، حاول مجدداً! 🤔"
+        }
+    }
+
+    fun markBedoonKalamActingSuccess() {
+        _bedoonKalamSolved.value = true
+        bedoonKalamTimerJob?.cancel()
+        _bedoonKalamScore.value += 20
+        audioEffects.playVictory()
+        repository.addPointsAndCoins(20, 10)
+        _bedoonKalamFeedback.value = "تمثيل أسطوري! تم تخمين البطاقة بنجاح 🎭"
+        recordPartyGameScore("بدون كلام", "party", 20, "تمثيل بطاقة ${_bedoonKalamCurrent.value.title} 🎭")
+    }
+
+    fun nextBedoonKalam() {
+        audioEffects.playClick()
+        bedoonKalamTimerJob?.cancel()
+        val list = _bedoonKalamList.value
+        val nextIdx = (_bedoonKalamIndex.value + 1) % list.size
+        _bedoonKalamIndex.value = nextIdx
+        _bedoonKalamCurrent.value = list[nextIdx]
+        _bedoonKalamTimeLeft.value = if (_bedoonKalamMode.value == BedoonKalamMode.ACTING_CHARADES) 90 else 60
+        _bedoonKalamIsCardRevealed.value = false
+        _bedoonKalamRevealedHints.value = 0
+        _bedoonKalamSolved.value = false
+        _bedoonKalamFeedback.value = null
+        startBedoonKalamTimer()
+    }
+
+    // =========================================================================
+    // 6. التابو العربي (THE FORBIDDEN WORD / TABOO)
+    // =========================================================================
+    private var tabooTimerJob: Job? = null
+
+    private val _tabooList = MutableStateFlow(ArabicGatheringGamesRepository.tabooCards.shuffled())
+    private val _tabooIndex = MutableStateFlow(0)
+    private val _tabooCurrent = MutableStateFlow(ArabicGatheringGamesRepository.tabooCards[0])
+    val tabooCurrent: StateFlow<TabooCard> = _tabooCurrent.asStateFlow()
+
+    private val _tabooTimeLeft = MutableStateFlow(60)
+    val tabooTimeLeft: StateFlow<Int> = _tabooTimeLeft.asStateFlow()
+
+    private val _tabooScore = MutableStateFlow(0)
+    val tabooScore: StateFlow<Int> = _tabooScore.asStateFlow()
+
+    private val _tabooPenalties = MutableStateFlow(0)
+    val tabooPenalties: StateFlow<Int> = _tabooPenalties.asStateFlow()
+
+    private val _tabooIsRunning = MutableStateFlow(false)
+    val tabooIsRunning: StateFlow<Boolean> = _tabooIsRunning.asStateFlow()
+
+    fun startTabooGame() {
+        audioEffects.playClick()
+        tabooTimerJob?.cancel()
+        val list = ArabicGatheringGamesRepository.tabooCards.shuffled()
+        _tabooList.value = list
+        _tabooIndex.value = 0
+        _tabooCurrent.value = list[0]
+        _tabooScore.value = 0
+        _tabooPenalties.value = 0
+        _tabooTimeLeft.value = 60
+        _tabooIsRunning.value = false
+        navigateTo(GameScreen.TabooScreen)
+    }
+
+    fun startTabooTimer() {
+        if (_tabooIsRunning.value) return
+        audioEffects.playWhistle()
+        _tabooIsRunning.value = true
+        _tabooTimeLeft.value = 60
+
+        tabooTimerJob?.cancel()
+        tabooTimerJob = viewModelScope.launch {
+            while (_tabooTimeLeft.value > 0 && _tabooIsRunning.value) {
+                delay(1000)
+                _tabooTimeLeft.value -= 1
+                if (_tabooTimeLeft.value in 1..10) {
+                    audioEffects.playTick()
+                }
+            }
+            if (_tabooTimeLeft.value <= 0) {
+                _tabooIsRunning.value = false
+                audioEffects.playWhistle()
+            }
+        }
+    }
+
+    fun tabooSuccess() {
+        if (!_tabooIsRunning.value) return
+        audioEffects.playCorrect()
+        _tabooScore.value += 1
+        repository.addPointsAndCoins(15, 5)
+        recordPartyGameScore("التابو العربي", "party", 15, "شرح كلمة ${_tabooCurrent.value.mainWord} 🚫")
+        nextTabooCard()
+    }
+
+    fun tabooForbiddenWordPenalty() {
+        if (!_tabooIsRunning.value) return
+        audioEffects.playWrong()
+        _tabooPenalties.value += 1
+        if (_tabooScore.value > 0) _tabooScore.value -= 1
+        nextTabooCard()
+    }
+
+    fun tabooSkip() {
+        audioEffects.playClick()
+        nextTabooCard()
+    }
+
+    private fun nextTabooCard() {
+        val list = _tabooList.value
+        val nextIdx = (_tabooIndex.value + 1) % list.size
+        _tabooIndex.value = nextIdx
+        _tabooCurrent.value = list[nextIdx]
+    }
+
+    // =========================================================================
+    // 7. كمّل المثل الشعبي (PROVERB COMPLETION)
+    // =========================================================================
+    private val _proverbList = MutableStateFlow(ArabicGatheringGamesRepository.proverbItems.shuffled())
+    private val _proverbIndex = MutableStateFlow(0)
+    private val _proverbCurrent = MutableStateFlow(ArabicGatheringGamesRepository.proverbItems[0])
+    val proverbCurrent: StateFlow<ProverbItem> = _proverbCurrent.asStateFlow()
+
+    private val _proverbStreak = MutableStateFlow(0)
+    val proverbStreak: StateFlow<Int> = _proverbStreak.asStateFlow()
+
+    private val _proverbScore = MutableStateFlow(0)
+    val proverbScore: StateFlow<Int> = _proverbScore.asStateFlow()
+
+    private val _selectedProverbOption = MutableStateFlow<String?>(null)
+    val selectedProverbOption: StateFlow<String?> = _selectedProverbOption.asStateFlow()
+
+    private val _proverbIsCorrect = MutableStateFlow<Boolean?>(null)
+    val proverbIsCorrect: StateFlow<Boolean?> = _proverbIsCorrect.asStateFlow()
+
+    fun startProverbsGame() {
+        audioEffects.playClick()
+        val list = ArabicGatheringGamesRepository.proverbItems.shuffled()
+        _proverbList.value = list
+        _proverbIndex.value = 0
+        _proverbCurrent.value = list[0]
+        _proverbStreak.value = 0
+        _proverbScore.value = 0
+        _selectedProverbOption.value = null
+        _proverbIsCorrect.value = null
+        navigateTo(GameScreen.ProverbsScreen)
+    }
+
+    fun selectProverbAnswer(option: String) {
+        if (_selectedProverbOption.value != null) return
+        _selectedProverbOption.value = option
+        val isCorrect = option == _proverbCurrent.value.correctAnswer
+        _proverbIsCorrect.value = isCorrect
+
+        if (isCorrect) {
+            audioEffects.playCorrect()
+            val newStreak = _proverbStreak.value + 1
+            _proverbStreak.value = newStreak
+            val pts = 15 * newStreak
+            _proverbScore.value += pts
+            repository.addPointsAndCoins(pts, pts / 3)
+            recordPartyGameScore("كمّل المثل الشعبي", "party", pts, "سلسلة $newStreak أمثال متتالية 📜")
+        } else {
+            audioEffects.playWrong()
+            _proverbStreak.value = 0
+        }
+    }
+
+    fun nextProverb() {
+        audioEffects.playClick()
+        val list = _proverbList.value
+        val nextIdx = (_proverbIndex.value + 1) % list.size
+        _proverbIndex.value = nextIdx
+        _proverbCurrent.value = list[nextIdx]
+        _selectedProverbOption.value = null
+        _proverbIsCorrect.value = null
+    }
+
+    // =========================================================================
+    // 8. المليون العربي (WHO WANTS TO BE A MILLIONAIRE)
+    // =========================================================================
+    private val _millionaireList = MutableStateFlow(ArabicGatheringGamesRepository.millionaireQuestions)
+    private val _millionaireLevel = MutableStateFlow(1) // 1..15
+    val millionaireLevel: StateFlow<Int> = _millionaireLevel.asStateFlow()
+
+    private val _millionaireQuestion = MutableStateFlow(ArabicGatheringGamesRepository.millionaireQuestions[0])
+    val millionaireQuestion: StateFlow<MillionaireQuestion> = _millionaireQuestion.asStateFlow()
+
+    private val _millionaireSelectedOption = MutableStateFlow<Int?>(null)
+    val millionaireSelectedOption: StateFlow<Int?> = _millionaireSelectedOption.asStateFlow()
+
+    private val _millionaireIsCorrect = MutableStateFlow<Boolean?>(null)
+    val millionaireIsCorrect: StateFlow<Boolean?> = _millionaireIsCorrect.asStateFlow()
+
+    private val _millionaireFiftyFiftyUsed = MutableStateFlow(false)
+    val millionaireFiftyFiftyUsed: StateFlow<Boolean> = _millionaireFiftyFiftyUsed.asStateFlow()
+
+    private val _millionaireEliminatedIndices = MutableStateFlow<List<Int>>(emptyList())
+    val millionaireEliminatedIndices: StateFlow<List<Int>> = _millionaireEliminatedIndices.asStateFlow()
+
+    private val _millionaireAudienceUsed = MutableStateFlow(false)
+    val millionaireAudienceUsed: StateFlow<Boolean> = _millionaireAudienceUsed.asStateFlow()
+
+    private val _millionaireShowAudience = MutableStateFlow(false)
+    val millionaireShowAudience: StateFlow<Boolean> = _millionaireShowAudience.asStateFlow()
+
+    private val _millionaireFriendUsed = MutableStateFlow(false)
+    val millionaireFriendUsed: StateFlow<Boolean> = _millionaireFriendUsed.asStateFlow()
+
+    private val _millionaireFriendTip = MutableStateFlow<String?>(null)
+    val millionaireFriendTip: StateFlow<String?> = _millionaireFriendTip.asStateFlow()
+
+    private val _millionaireGameOver = MutableStateFlow(false)
+    val millionaireGameOver: StateFlow<Boolean> = _millionaireGameOver.asStateFlow()
+
+    private val _millionaireWonMillion = MutableStateFlow(false)
+    val millionaireWonMillion: StateFlow<Boolean> = _millionaireWonMillion.asStateFlow()
+
+    private val _millionairePrizeWon = MutableStateFlow(0)
+    val millionairePrizeWon: StateFlow<Int> = _millionairePrizeWon.asStateFlow()
+
+    fun startMillionaireGame() {
+        audioEffects.playClick()
+        val questions = ArabicGatheringGamesRepository.millionaireQuestions
+        _millionaireList.value = questions
+        _millionaireLevel.value = 1
+        _millionaireQuestion.value = questions[0]
+        _millionaireSelectedOption.value = null
+        _millionaireIsCorrect.value = null
+        _millionaireFiftyFiftyUsed.value = false
+        _millionaireEliminatedIndices.value = emptyList()
+        _millionaireAudienceUsed.value = false
+        _millionaireShowAudience.value = false
+        _millionaireFriendUsed.value = false
+        _millionaireFriendTip.value = null
+        _millionaireGameOver.value = false
+        _millionaireWonMillion.value = false
+        _millionairePrizeWon.value = 0
+        navigateTo(GameScreen.MillionaireScreen)
+    }
+
+    fun selectMillionaireOption(index: Int) {
+        if (_millionaireSelectedOption.value != null || _millionaireGameOver.value) return
+        _millionaireSelectedOption.value = index
+        val currentQ = _millionaireQuestion.value
+        val isCorrect = index == currentQ.correctIndex
+        _millionaireIsCorrect.value = isCorrect
+
+        if (isCorrect) {
+            audioEffects.playVictory()
+            _millionairePrizeWon.value = currentQ.prizeValue
+            repository.addPointsAndCoins(currentQ.prizeValue / 10, currentQ.prizeValue / 50)
+            recordPartyGameScore("المليون العربي", "party", currentQ.prizeValue, "المستوى ${_millionaireLevel.value} • ${currentQ.prizeValue} نقطة 💰")
+            if (_millionaireLevel.value >= 15) {
+                _millionaireWonMillion.value = true
+                _millionaireGameOver.value = true
+            }
+        } else {
+            audioEffects.playWrong()
+            _millionaireGameOver.value = true
+            // Fall back to safety threshold
+            val fallbackPrize = when {
+                _millionaireLevel.value > 10 -> 32000
+                _millionaireLevel.value > 5 -> 1000
+                else -> 0
+            }
+            _millionairePrizeWon.value = fallbackPrize
+        }
+    }
+
+    fun useMillionaireFiftyFifty() {
+        if (_millionaireFiftyFiftyUsed.value || _millionaireSelectedOption.value != null) return
+        audioEffects.playClick()
+        _millionaireFiftyFiftyUsed.value = true
+        val correct = _millionaireQuestion.value.correctIndex
+        val wrongIndices = listOf(0, 1, 2, 3).filter { it != correct }.shuffled().take(2)
+        _millionaireEliminatedIndices.value = wrongIndices
+    }
+
+    fun useMillionaireAudience() {
+        if (_millionaireAudienceUsed.value || _millionaireSelectedOption.value != null) return
+        audioEffects.playClick()
+        _millionaireAudienceUsed.value = true
+        _millionaireShowAudience.value = true
+    }
+
+    fun dismissMillionaireAudience() {
+        _millionaireShowAudience.value = false
+    }
+
+    fun useMillionaireFriend() {
+        if (_millionaireFriendUsed.value || _millionaireSelectedOption.value != null) return
+        audioEffects.playClick()
+        _millionaireFriendUsed.value = true
+        _millionaireFriendTip.value = _millionaireQuestion.value.friendTip
+    }
+
+    fun dismissMillionaireFriend() {
+        _millionaireFriendTip.value = null
+    }
+
+    fun withdrawMillionaire() {
+        if (_millionaireGameOver.value) return
+        audioEffects.playWhistle()
+        _millionaireGameOver.value = true
+    }
+
+    fun nextMillionaireQuestion() {
+        if (_millionaireLevel.value >= 15) return
+        audioEffects.playClick()
+        val nextLevel = _millionaireLevel.value + 1
+        _millionaireLevel.value = nextLevel
+        _millionaireQuestion.value = _millionaireList.value[nextLevel - 1]
+        _millionaireSelectedOption.value = null
+        _millionaireIsCorrect.value = null
+        _millionaireEliminatedIndices.value = emptyList()
+        _millionaireShowAudience.value = false
+        _millionaireFriendTip.value = null
+    }
+
+    // =========================================================================
+    // 9. الرابط العجيب / أربع كلمات وكلمة (FOUR CLUES ONE WORD)
+    // =========================================================================
+    private val _fourCluesList = MutableStateFlow(ArabicGatheringGamesRepository.fourCluesItems.shuffled())
+    private val _fourCluesIndex = MutableStateFlow(0)
+    private val _fourCluesCurrent = MutableStateFlow(ArabicGatheringGamesRepository.fourCluesItems[0])
+    val fourCluesCurrent: StateFlow<FourCluesItem> = _fourCluesCurrent.asStateFlow()
+
+    private val _fourCluesScore = MutableStateFlow(0)
+    val fourCluesScore: StateFlow<Int> = _fourCluesScore.asStateFlow()
+
+    private val _fourCluesSolved = MutableStateFlow(false)
+    val fourCluesSolved: StateFlow<Boolean> = _fourCluesSolved.asStateFlow()
+
+    private val _fourCluesFeedback = MutableStateFlow<String?>(null)
+    val fourCluesFeedback: StateFlow<String?> = _fourCluesFeedback.asStateFlow()
+
+    fun startFourCluesGame() {
+        audioEffects.playClick()
+        val list = ArabicGatheringGamesRepository.fourCluesItems.shuffled()
+        _fourCluesList.value = list
+        _fourCluesIndex.value = 0
+        _fourCluesCurrent.value = list[0]
+        _fourCluesScore.value = 0
+        _fourCluesSolved.value = false
+        _fourCluesFeedback.value = null
+        navigateTo(GameScreen.FourCluesScreen)
+    }
+
+    fun submitFourCluesAnswer(guess: String) {
+        val trimmed = guess.trim()
+        if (trimmed.isEmpty()) return
+        val current = _fourCluesCurrent.value
+
+        val isCorrect = trimmed.equals(current.answer, ignoreCase = true) ||
+                trimmed.equals(current.answer.removePrefix("ال"), ignoreCase = true)
+
+        if (isCorrect) {
+            _fourCluesSolved.value = true
+            _fourCluesScore.value += 20
+            audioEffects.playVictory()
+            repository.addPointsAndCoins(20, 10)
+            _fourCluesFeedback.value = "عبقري! الرابط المشترك هو (${current.answer}) 🌟"
+            recordPartyGameScore("الرابط العجيب", "party", 20, "حل رابط ${current.categoryHint} (${current.answer}) 🔍")
+        } else {
+            audioEffects.playWrong()
+            _fourCluesFeedback.value = "إجابة غير صحيحة، فكر في الرابط المشترك جيداً! 🤔"
+        }
+    }
+
+    fun nextFourClues() {
+        audioEffects.playClick()
+        val list = _fourCluesList.value
+        val nextIdx = (_fourCluesIndex.value + 1) % list.size
+        _fourCluesIndex.value = nextIdx
+        _fourCluesCurrent.value = list[nextIdx]
+        _fourCluesSolved.value = false
+        _fourCluesFeedback.value = null
+    }
+
+    fun startBedoonKalamGame(mode: BedoonKalamMode = BedoonKalamMode.EMOJI_GUESS) = startBedoonKalam(mode)
+
+    // =========================================================================
+    // 10. وضع التجمع على جهاز واحد (PASS & PLAY TEAMS)
+    // =========================================================================
+    private val _gatheringTeamState = MutableStateFlow(GatheringTeamState())
+    val gatheringTeamState: StateFlow<GatheringTeamState> = _gatheringTeamState.asStateFlow()
+
+    fun startPassAndPlay(teamRed: String = "الفريق الأحمر 🔴", teamBlue: String = "الفريق الأزرق 🔵", rounds: Int = 5) {
+        audioEffects.playWhistle()
+        _gatheringTeamState.value = GatheringTeamState(
+            teamRedName = teamRed.ifBlank { "الفريق الأحمر 🔴" },
+            teamBlueName = teamBlue.ifBlank { "الفريق الأزرق 🔵" },
+            redScore = 0,
+            blueScore = 0,
+            currentTurnTeam = "RED",
+            currentRound = 1,
+            totalRounds = rounds,
+            isGameFinished = false
+        )
+        navigateTo(GameScreen.PassAndPlayScreen)
+    }
+
+    fun awardPassAndPlayPoints(points: Int) {
+        audioEffects.playVictory()
+        val current = _gatheringTeamState.value
+        val newRed = if (current.currentTurnTeam == "RED") current.redScore + points else current.redScore
+        val newBlue = if (current.currentTurnTeam == "BLUE") current.blueScore + points else current.blueScore
+
+        val isRedTurn = current.currentTurnTeam == "RED"
+        val activeName = if (isRedTurn) current.teamRedName else current.teamBlueName
+        recordPartyGameScore("ديربي التجمعات", "party", points, "$activeName • جولة ${current.currentRound} 👥")
+
+        val nextTeam = if (isRedTurn) "BLUE" else "RED"
+        val nextRound = if (!isRedTurn) current.currentRound + 1 else current.currentRound
+        val isFinished = !isRedTurn && (nextRound > current.totalRounds)
+
+        _gatheringTeamState.value = current.copy(
+            redScore = newRed,
+            blueScore = newBlue,
+            currentTurnTeam = nextTeam,
+            currentRound = nextRound,
+            isGameFinished = isFinished
+        )
+    }
+
+    fun switchPassAndPlayTurn() {
+        audioEffects.playClick()
+        val current = _gatheringTeamState.value
+        val isRedTurn = current.currentTurnTeam == "RED"
+        val nextTeam = if (isRedTurn) "BLUE" else "RED"
+        val nextRound = if (!isRedTurn) current.currentRound + 1 else current.currentRound
+        val isFinished = !isRedTurn && (nextRound > current.totalRounds)
+
+        _gatheringTeamState.value = current.copy(
+            currentTurnTeam = nextTeam,
+            currentRound = nextRound,
+            isGameFinished = isFinished
+        )
+    }
+
+    fun resetPassAndPlay() {
+        audioEffects.playClick()
+        val current = _gatheringTeamState.value
+        _gatheringTeamState.value = current.copy(
+            redScore = 0,
+            blueScore = 0,
+            currentTurnTeam = "RED",
+            currentRound = 1,
+            isGameFinished = false
+        )
     }
 
     override fun onCleared() {
         super.onCleared()
         audioEffects.release()
+        speechToTextManager.destroy()
         pvpTimerJob?.cancel()
         pvpOpponentJob?.cancel()
         adJob?.cancel()
         tsTimerJob?.cancel()
+        autobusTimerJob?.cancel()
+        autobusAiJob?.cancel()
+        fiveSecondsTimerJob?.cancel()
+        bedoonKalamTimerJob?.cancel()
+        tabooTimerJob?.cancel()
     }
 }
+
+// -----------------------------------------------------------------------------
+// PRIVATE HELPER FUNCTIONS
+// -----------------------------------------------------------------------------
+private fun generateChallengeCode(): String {
+    val prefixes = listOf("CHAMP", "KICK", "TAHADDI", "MADRID", "BARCA", "CAPTAIN", "GOAL", "LEGEND")
+    val num = (1000..9999).random()
+    return "${prefixes.random()}-$num"
+}
+
+private fun defaultPresetFriends(): List<FriendlyChallengeInfo> = listOf(
+    FriendlyChallengeInfo(
+        code = "BARCA-10",
+        friendName = "كابتن زياد",
+        friendAvatar = "🔵🔴",
+        friendClub = "برشلونة",
+        difficulty = GameDifficulty.MEDIUM,
+        message = "جاهز لكلاسيكو ناري! يلا وريني معلوماتك ⚽"
+    ),
+    FriendlyChallengeInfo(
+        code = "REAL-07",
+        friendName = "عمر المدريدي",
+        friendAvatar = "👑",
+        friendClub = "ريال مدريد",
+        difficulty = GameDifficulty.HARD,
+        message = "تحدي الأساطير الودي، مين ملك المونديال الحقيقي؟ 🏆"
+    ),
+    FriendlyChallengeInfo(
+        code = "HILAL-24",
+        friendName = "سعود الزعيم",
+        friendAvatar = "💙",
+        friendClub = "الهلال السعودي",
+        difficulty = GameDifficulty.MEDIUM,
+        message = "تحدي كروي عربي أصيل! مستعد للبداية؟ 🌟"
+    ),
+    FriendlyChallengeInfo(
+        code = "EGYPT-11",
+        friendName = "أحمد فخر العرب",
+        friendAvatar = "🇪🇬",
+        friendClub = "ليفربول",
+        difficulty = GameDifficulty.EASY,
+        message = "مواجهة سريعة وخفيفة بين الأصدقاء! ⚽"
+    )
+)
+
+private fun defaultFriendlyHistory(): List<FriendlyMatchHistoryItem> = listOf(
+    FriendlyMatchHistoryItem(
+        id = "fm_1",
+        friendName = "كابتن زياد",
+        friendAvatar = "🔵🔴",
+        userScore = 4,
+        friendScore = 2,
+        isWin = true,
+        challengeCode = "BARCA-10",
+        timeAgo = "اليوم 16:30"
+    ),
+    FriendlyMatchHistoryItem(
+        id = "fm_2",
+        friendName = "عمر المدريدي",
+        friendAvatar = "👑",
+        userScore = 3,
+        friendScore = 3,
+        isWin = false,
+        challengeCode = "REAL-07",
+        timeAgo = "أمس 21:10"
+    )
+)
 

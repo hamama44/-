@@ -9,9 +9,11 @@ val PitchSurface = Color(0xFF0F261B)
 val PitchCard = Color(0xFF143324)
 val PitchCardBorder = Color(0xFF1F4D37)
 val PitchCardElevated = Color(0xFF1B4230)
+val PitchDivider = PitchCardBorder
 
 // Neon Emerald & Grass Green
 val EmeraldNeon = Color(0xFF00E676)
+val EmeraldGreen = EmeraldNeon
 val EmeraldLight = Color(0xFF69F0AE)
 val EmeraldDark = Color(0xFF00B0FF)
 val GrassGreen = Color(0xFF10B981)

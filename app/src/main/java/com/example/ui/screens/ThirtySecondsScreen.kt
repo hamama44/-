@@ -14,8 +14,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -162,6 +162,47 @@ fun ThirtySecondsSelectScreen(viewModel: FootballGameViewModel) {
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
                             text = "نادي أو منتخب محدد، اذكر أكبر عدد من نجومه مع تصحيح تلقائي وذكي للأسماء.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Mode 3 Card: فقرات نصوح الخاصة (الجرس، سين جيم، مهنة لاعب، والتعويض)
+            GlowCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("mode_nasouh_rounds"),
+                borderColor = Color(0xFFFF1744).copy(alpha = 0.6f),
+                onClick = { viewModel.navigateTo(GameScreen.ThirtySecondsRoundsScreen) }
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFFF1744).copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(text = "🔔", fontSize = 26.sp)
+                    }
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "النمط الثالث: فقرات نصوح الخاصة 🔥",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color(0xFFFF5252),
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "صراع الجرس 🔔، سين جيم ❓، مهنة لاعب 🗺️، ووقت التعويض الخاطف ⏱️.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary
                         )
@@ -517,7 +558,7 @@ fun ThirtySecondsPlayersScreen(viewModel: FootballGameViewModel) {
                             .background(EmeraldNeon)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Send,
+                            imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "إرسال",
                             tint = PitchBlack
                         )

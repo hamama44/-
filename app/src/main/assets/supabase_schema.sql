@@ -1,5 +1,6 @@
 -- =====================================================================
 -- ملعب التحدي (Malab Al-Tahaddi) - Supabase Database Schema
+-- يدعم تخزين الأسئلة، اللاعبين، لوحة الصدارة العالمية، والغرف الأونلاين المباشرة
 -- =====================================================================
 
 -- 1. جدول الأسئلة الكروية (Questions Table)
@@ -28,7 +29,7 @@ CREATE TABLE IF NOT EXISTS public.players (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- 3. جدول النتائج ولوحة الشرف (Scores & Leaderboard Table)
+-- 3. جدول النتائج ولوحة الشرف العالمية (Scores & Leaderboard Table)
 CREATE TABLE IF NOT EXISTS public.scores (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     player_name TEXT NOT NULL,
@@ -39,24 +40,57 @@ CREATE TABLE IF NOT EXISTS public.scores (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
+-- 4. جدول غرف اللعب المباشر أونلاين (Online Multiplayer Game Rooms)
+CREATE TABLE IF NOT EXISTS public.game_rooms (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    room_code TEXT UNIQUE NOT NULL, -- e.g. 'STAD77'
+    game_type TEXT NOT NULL DEFAULT 'thirty_seconds', -- 'thirty_seconds', 'buzzer', 'tictactoe', 'auction'
+    status TEXT NOT NULL DEFAULT 'waiting', -- 'waiting', 'playing', 'finished'
+    current_round INTEGER DEFAULT 1,
+    max_rounds INTEGER DEFAULT 5,
+    host_name TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 5. جدول لاعبي الغرفة الأونلاين (Room Players)
+CREATE TABLE IF NOT EXISTS public.room_players (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    room_code TEXT NOT NULL REFERENCES public.game_rooms(room_code) ON DELETE CASCADE,
+    player_name TEXT NOT NULL,
+    team_color TEXT DEFAULT 'RED', -- 'RED', 'BLUE'
+    score INTEGER DEFAULT 0,
+    is_ready BOOLEAN DEFAULT false,
+    is_host BOOLEAN DEFAULT false,
+    last_ping TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
 -- Enable Row Level Security (RLS)
 ALTER TABLE public.questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.players ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.scores ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.game_rooms ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.room_players ENABLE ROW LEVEL SECURITY;
 
--- Allow public read access to all users
+-- Allow public read & write access for gaming clients
 CREATE POLICY "Public read questions" ON public.questions FOR SELECT USING (true);
 CREATE POLICY "Public read players" ON public.players FOR SELECT USING (true);
 CREATE POLICY "Public read scores" ON public.scores FOR SELECT USING (true);
-
--- Allow inserting scores
 CREATE POLICY "Public insert scores" ON public.scores FOR INSERT WITH CHECK (true);
+
+CREATE POLICY "Public read game_rooms" ON public.game_rooms FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Public read room_players" ON public.room_players FOR ALL USING (true) WITH CHECK (true);
+
+-- Enable Realtime publication for online rooms and scores
+BEGIN;
+  DROP PUBLICATION IF EXISTS supabase_realtime;
+  CREATE PUBLICATION supabase_realtime FOR TABLE public.game_rooms, public.room_players, public.scores;
+COMMIT;
 
 -- =====================================================================
 -- Initial Seed Data (بيانات أولية بالعربية)
 -- =====================================================================
 
--- أسئلة تحدي الثلاثين وصباحو
 INSERT INTO public.questions (id, game_type, question, options, correct_index, difficulty, category, explanation) VALUES
 ('q1', 'thirty_seconds', 'من هو الهداف التاريخي لكأس العالم؟', '["ميروسلاف كلوزه", "رونالدو البرازيلي", "ليونيل ميسي", "بيليه"]', 0, 'easy', 'كأس العالم', 'كلوزه برصيد 16 هدفاً مونديالياً.'),
 ('q2', 'thirty_seconds', 'كم عدد كرات الذهب التي فاز بها ليونيل ميسي؟', '["8 كرات", "7 كرات", "5 كرات", "6 كرات"]', 0, 'easy', 'جوائز', 'ميسي حقق 8 كرات ذهبية تاريخية.'),
@@ -65,19 +99,6 @@ INSERT INTO public.questions (id, game_type, question, options, correct_index, d
 ('q5', 'true_false', 'هل حقق كريستيانو رونالدو لقب أمم أوروبا 2016 مع البرتغال؟', '["صح", "غلط"]', 0, 'easy', 'يورو', 'نعم حقق اللقب بعد الفوز على فرنسا 1-0.')
 ON CONFLICT (id) DO NOTHING;
 
--- لاعبو التحديات
-INSERT INTO public.players (id, name, nationality, current_club, position, shirt_number, hints, career_history) VALUES
-('p1', 'محمد صلاح', 'مصر', 'ليفربول', 'جناح أيمن', 11,
- '[{"title": "الجنسية", "value": "مصري"}, {"title": "النادي", "value": "ليفربول"}, {"title": "الرقم", "value": "11"}]',
- '[{"club": "المقاولون العرب", "years": "2010-2012"}, {"club": "بازل", "years": "2012-2014"}, {"club": "تشيلسي", "years": "2014-2016"}, {"club": "روما", "years": "2015-2017"}, {"club": "ليفربول", "years": "2017-الآن"}]'
-),
-('p2', 'لوكا مودريتش', 'كرواتيا', 'ريال مدريد', 'وسط', 10,
- '[{"title": "الجنسية", "value": "كرواتي"}, {"title": "الكرة الذهبية", "value": "2018"}, {"title": "النادي", "value": "ريال مدريد"}]',
- '[{"club": "دينامو زغرب", "years": "2003-2008"}, {"club": "توتنهام", "years": "2008-2012"}, {"club": "ريال مدريد", "years": "2012-الآن"}]'
-)
-ON CONFLICT (id) DO NOTHING;
-
--- نتائج المتصدرين
 INSERT INTO public.scores (player_name, points, coins, level_title, favorite_club) VALUES
 ('عمر المدريدي 👑', 4820, 950, 'أسطورة الملاعب', 'ريال مدريد'),
 ('ياسين الأطلسي 🇲🇦', 4350, 820, 'محترف دولي', 'الوداد البيضاوي'),
