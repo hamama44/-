@@ -4,19 +4,46 @@ name: Question Bot (إضافة أسئلة تلقائياً)
 # بيشتغل إمتى؟
 #   - كل 6 ساعات، أو يدوياً من تبويب Actions (Run workflow) مع تغيير العدد
 #
-# البوت بيولّد أسئلة بـ Gemini، بيدقّقها، بيمنع التكرار، وبينشرها في جدول
-# public/questions. التطبيق بيقرأ من الجدول تلقائياً ⇒ مفيش حاجة تتعمل في
-# المتجر كل مرة، وده المقصود بـ«دايماً متحدّثة».
+# البوت بيولّد أسئلة (OpenRouter أو Gemini) أو بياخد من ملف curated، بيدقّقها،
+# بيمنع التكرار، وبينشرها في جدول public/questions. التطبيق بيقرأ من الجدول
+# تلقائياً ⇒ مفيش حاجة تتعمل في المتجر كل مرة، وده المقصود بـ«دايماً متحدّثة».
 #
 # ===========================================================================
-# الإعداد مرة واحدة (GitHub → Settings → Secrets and variables → Actions):
-#   SUPABASE_URL              https://xyzcompany.supabase.co
-#   SUPABASE_SERVICE_ROLE_KEY مفتاح service_role — بيسمح بالكتابة وبيتجاوز RLS.
-#                             ⚠️ أقوى مفتاح في المشروع: في Secrets بس،
-#                             مش في الـrepo ومش في الـAPK.
-#   GEMINI_API_KEY            اختياري — من غيره البوت ينشر ملف curated فقط.
+# الإعداد مرة واحدة: GitHub → Settings → Secrets and variables → Actions
 #
-# وبعدين نفّذ supabase_schema_v3.sql مرة واحدة في Supabase SQL Editor.
+#   ┌─ Secrets (مفاتيح سرية) ──────────────────────────────────────────────
+#   │ SUPABASE_URL               https://xyzcompany.supabase.co
+#   │ SUPABASE_SERVICE_ROLE_KEY  مفتاح service_role — بيسمح بالكتابة وبيتجاوز RLS.
+#   │                            ⚠️ أقوى مفتاح في المشروع: في Secrets بس،
+#   │                            مش في الـrepo ومش في الـAPK.
+#   │ OPENROUTER_API_KEY         مفتاح OpenRouter (المسار المفضّل الآن)
+#   │ GEMINI_API_KEY             اختياري — بديل مباشر لو عايز Google الأصلي
+#   └──────────────────────────────────────────────────────────────────────
+#   ┌─ Variables (مش سرية — تتغيّر من الواجهة بدون edit للملف) ────────────
+#   │ LLM_MODEL                  google/gemini-2.5-flash-exp:free   (افتراضي)
+#   │ LLM_BASE_URL               https://openrouter.ai/api/v1       (اختياري)
+#   │ LLM_PROVIDER               auto | openrouter | gemini          (اختياري)
+#   │ QUESTION_BOT_DIFFICULTY    mixed | easy | medium | hard |
+#   │                            mostly_easy | mostly_hard | medium_hard
+#   │ QUESTION_BOT_DAILY_CAP     25
+#   └──────────────────────────────────────────────────────────────────────
+#
+# ومطلوب مرة واحدة كمان: نفّذ supabase_schema_v3.sql في Supabase SQL Editor.
+#
+# ===========================================================================
+#كام سؤال وبياكل كام دقيقة؟ (GitHub Free = 2000 دقيقة/شهر للريبو الخاص)
+#   - الجدول ده 4 تشغيلات/يوم = ~120 تشغيل/شهر.
+#   - كل تشغيل: checkout + setup-python ≈ 25 ثانية، و1–8 طلبات توليد
+#     (5–20 ثانية للطلب)، وفحص تكرار + نشر ≈ 10 ثواني ⇒ **~1.5–2 دقيقة**.
+#   - 120 × 2 د = **~240 دقيقة/شهر = 12% من الـ2000** ⇒ مفيش أي مشكلة.
+#     (ولو الريبو Public، دقايق Linux runners أصلاً بلا حد.)
+#   - المحصول مش بتحدده الدقايق، ده بيتحدد من:
+#       1) QUESTION_BOT_DAILY_CAP = 25/يوم  ⇒ **سقف ~750 سؤال/شهر** ← المهيمن
+#       2) معدل رفض التدقيق (30–60%) ⇒ **الواقعي ~300–500 سؤال/شهر**
+#       3) حد OpenRouter المجاني = **50 طلب/يوم**: كل طلب بيرجع حتى 20 سؤال،
+#          فحد الطلبات بيسمح بنظرية بـ~1000 سؤال/يوم — مش هو العنق.
+#          الحارس LLM_MAX_REQUESTS_PER_RUN=10 × 4 تشغيلات = 40 طلب/يوم ⇒ تحت
+#          الـ50 بأمان. ⚠️ لو زوّدت عدد التشغيلات في اليوم نزّل الرقم ده.
 # ===========================================================================
 
 on:
@@ -36,14 +63,34 @@ on:
         default: "false"
         type: string
       source:
-        description: "المصدر: both / gemini / curated"
+        description: "المصدر: both / openrouter / gemini / curated"
         required: false
         default: "both"
         type: choice
         options:
           - both
+          - openrouter
           - gemini
           - curated
+      model:
+        description: "اسم الموديل (فاضي = LLM_MODEL أو الافتراضي المجاني)"
+        required: false
+        default: ""
+        type: string
+      difficulty:
+        description: "الصعوبة: فاضي=mixed، أو easy / medium / hard / mostly_hard / medium_hard"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - mixed
+          - easy
+          - medium
+          - hard
+          - mostly_easy
+          - mostly_hard
+          - medium_hard
 
 # تشغيل واحد في نفس اللحظة: لو تشغيلين تولّدوا في نفس الوقت، اليونيكون هيمسك
 # التكرار بس ده رمي شبكة بلا فايدة. الأهدأ إننا ما نبدأش أصلاً.
@@ -63,9 +110,20 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      # --- مزوّد التوليد: OpenRouter (موصى به) أو Gemini مباشرةً ---
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      # السقف اليومي في البوت نفسه، فحتى لو الـcron اتشغّل زيادة مايفخّش الجدول
-      QUESTION_BOT_DAILY_CAP: "25"
+      OPENROUTER_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      OPENROUTER_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+
+      # --- سياسة المحتوى ---
+      QUESTION_BOT_DAILY_CAP: ${{ vars.QUESTION_BOT_DAILY_CAP || '25' }}
+      QUESTION_BOT_DIFFICULTY: ${{ vars.QUESTION_BOT_DIFFICULTY }}
+      # حارس حد الطلبات المجاني (50/يوم). لو زوّدت عدد التشغيلات في اليوم،
+      # نزّل الرقم ده عشان 4 تشغيلات × 10 = 40 طلب < 50.
+      LLM_MAX_REQUESTS_PER_RUN: ${{ vars.LLM_MAX_REQUESTS_PER_RUN || '10' }}
 
     steps:
       - name: سحب الكود
@@ -76,8 +134,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # لو منطق التدقيق مكسور، الأأمن نوقف قبل أي كتابة: البوت النشر التلقائي
-      # معناه إن اللي هيوصل القاعدة هيوصل للاعيبين على طول.
+      # لو منطق التدقيق مكسور، الأأمن نوقف قبل أي كتابة: النشر تلقائي،
+      # فاللي هيوصل القاعدة هيوصل للاعيبين على طول.
       - name: اختبار منطق التدقيق
         run: python3 scripts/question_bot.py --self-test
 
@@ -87,21 +145,41 @@ jobs:
             echo "::error::ناقص SUPABASE_URL أو SUPABASE_SERVICE_ROLE_KEY في Secrets"
             exit 1
           fi
-          if [ -z "$GEMINI_API_KEY" ]; then
-            echo "::warning::GEMINI_API_KEY مش موجود — هيتم نشر ملف curated فقط"
+          if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$GEMINI_API_KEY" ]; then
+            echo "::warning::مفيش OPENROUTER_API_KEY ولا GEMINI_API_KEY — هيتم نشر ملف curated فقط"
+          elif [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "✅ التوليد على OpenRouter بالموديل: ${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}"
+            case "${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}" in
+              *:free) echo "ℹ️ موديل مجاني — حد OpenRouter 50 طلب/يوم و20/دقيقة" ;;
+              *)      echo "ℹ️ موديل مدفوع — هيتحاسب من رصيدك على عدد التوكنات" ;;
+            esac
+          else
+            echo "✅ التوليد على Gemini بالموديل: ${GEMINI_MODEL:-gemini-2.5-flash}"
           fi
-          echo "✅ الإعدادات كاملة"
 
       - name: تشغيل البوت
+        # المدخلات بتدخل عبر env مش داخل سطر الـcommand: كده نص المستخدم
+        # (مثلاً اسم موديل فيه فاصلة أو علامة اقتباس) ما يتفسرش كأمر shell،
+        # وبنستغني عن eval خالص.
+        env:
+          IN_LIMIT: ${{ github.event.inputs.limit || '6' }}
+          IN_SOURCE: ${{ github.event.inputs.source || 'both' }}
+          IN_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          IN_MODEL: ${{ github.event.inputs.model }}
+          IN_DIFFICULTY: ${{ github.event.inputs.difficulty }}
         run: |
-          ARGS="--limit ${{ github.event.inputs.limit || '6' }} --source ${{ github.event.inputs.source || 'both' }}"
-          if [ "${{ github.event.inputs.dry_run || 'false' }}" = "true" ]; then
-            ARGS="$ARGS --dry-run"
-          fi
+          ARGS=(--limit "$IN_LIMIT" --source "$IN_SOURCE")
+          if [ "$IN_DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          # المدخلات اليدوية بتدهس قيم الـvars، وده المقصود: «Run workflow»
+          # هو مكان التجربة السريعة قبل ما نغيّر الإعداد الدائم.
+          if [ -n "$IN_MODEL" ]; then ARGS+=(--model "$IN_MODEL"); fi
+          if [ -n "$IN_DIFFICULTY" ]; then ARGS+=(--difficulty "$IN_DIFFICULTY"); fi
+          if [ "$IN_SOURCE" = "openrouter" ]; then ARGS+=(--provider openrouter); fi
+          if [ "$IN_SOURCE" = "gemini" ]; then ARGS+=(--provider gemini); fi
           # الفشل الجزئي (بعض الدفعات اترفضت) مش كارثة، لكن الفشل الكامل
           # (كود 2: اتصال/إعدادات) لازم يبيّن الـworkflow أحمر عشان ننتبه.
           set +e
-          python3 scripts/question_bot.py $ARGS
+          python3 scripts/question_bot.py "${ARGS[@]}"
           CODE=$?
           set -e
           echo "BOT_EXIT_CODE=$CODE" >> "$GITHUB_ENV"
@@ -118,9 +196,15 @@ jobs:
             echo ""
             echo "- كود الخروج: \`${BOT_EXIT_CODE:-?}\`"
             echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
-            if [ -n "$GEMINI_API_KEY" ]; then
-              echo "- التوليد بـ Gemini: مفعّل ✅"
+            echo "- الموديل: \`${{ github.event.inputs.model || vars.LLM_MODEL || 'google/gemini-2.5-flash-exp:free' }}\`"
+            echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mixed (سهل/متوسط/صعب بالتناوب)' }}\`"
+            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '25' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '10' }}\`"
+            echo ""
+            if [ -n "$OPENROUTER_API_KEY" ]; then
+              echo "- التوليد: OpenRouter ✅"
+            elif [ -n "$GEMINI_API_KEY" ]; then
+              echo "- التوليد: Gemini ✅"
             else
-              echo "- التوليد بـ Gemini: معطّل (curated فقط) ⚠️"
+              echo "- التوليد: معطّل — curated فقط ⚠️"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

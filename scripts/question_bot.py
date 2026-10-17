@@ -19,10 +19,22 @@
     python3 scripts/question_bot.py --limit 12 --source both
     python3 scripts/question_bot.py --self-test       # بدائل الاختبارات
 
-المتغيرات البيئية (في CI بتيجي من GitHub Secrets):
+المتغيرات البيئية (في CI بتيجي من GitHub Secrets، ومحلياً من ملف .env):
     SUPABASE_URL        مثال https://xyzcompany.supabase.co
     SUPABASE_KEY        service_role key (كتابة) — مفيش بديل آمن ليه
-    GEMINI_API_KEY      اختياري — من غيره مصدر Gemini بيتخطّى بهدوء
+
+    مفتاح التوليد — أي مزوّد OpenAI-compatible، والاختيار أسهلهم OpenRouter:
+    OPENROUTER_API_KEY  مفتاح الـAPI
+    OPENROUTER_BASE_URL اختياري — الافتراضي https://openrouter.ai/api/v1
+    OPENROUTER_MODEL    اختياري — الافتراضي google/gemini-2.5-flash-exp:free
+    LLM_PROVIDER        auto | openrouter | gemini (auto = openrouter لو فيه
+                        مفتاح، وإلا Gemini لو فيه GEMINI_API_KEY)
+    GEMINI_API_KEY      بديل مباشر لمزود Google الأصلي
+
+    محتوى الأسئلة:
+    QUESTION_BOT_DAILY_CAP        سقف النشر اليومي (افتراضي 25)
+    QUESTION_BOT_DIFFICULTY       mixed | easy | medium | hard | mostly_easy ...
+    LLM_MAX_REQUESTS_PER_RUN      حارس حد طلبات OpenRouter المجاني (10)
 """
 
 from __future__ import annotations
@@ -43,15 +55,125 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # إعدادات ثابتة — لازم تفضل متزامنة مع قواعد التدقيق في التطبيق
 # ---------------------------------------------------------------------------
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# ---------------------------------------------------------------------------
+# قارئ .env — للتشغيل المحلي فقط
+# ---------------------------------------------------------------------------
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+#: ملفات الـenv المرتبة بالأولوية. `baked=True` معناها إن الملف ده بيقرأه
+#: كمان الـSecrets Gradle Plugin (`app/build.gradle.kts`) ويحط كل مفاتيحه في
+#: `BuildConfig` — أي **أي مفتاح سرّي للبوت هنا بيترفع جوه الـAPK**.
+#: عشان كده `scripts/.env` هو المكان الصحيح، والجذر للاعدادات العامة فقط.
+_DOTENV_SOURCES = (
+    ("scripts/.env", False),      # بجوار السكربت — البوت بس اللي بيقراه
+    (".env", True),               # ملف التطبيق — بيتدهن في BuildConfig
+    ("../.env", True),
+)
+
+
+def _dotenv_candidates() -> List[Tuple[str, bool]]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    out: List[Tuple[str, bool]] = []
+    for rel, baked in _DOTENV_SOURCES:
+        path = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(here, rel))
+        out.append((path, baked))
+    return out
+
+
+def load_dotenv() -> Tuple[Optional[str], bool]:
+    """
+    يقرأ ملفات .env الموجودة (من غير ما يدهس env var حقيقي)، ويرجع
+    (المسار الأساسي، هل الملف ده بيتدهن في الـAPK ولا لأ).
+
+    `os.environ.setdefault` هو النقطة: المتغير اللي حدده الـrunner أو الـshell
+    بيكسب دايماً، وده بيمنع ملف .env قديم يسرّب مفتاح غلط في CI.
+    """
+    primary: Optional[str] = None
+    primary_baked = False
+    for path, baked in _dotenv_candidates():
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and value:
+                        os.environ.setdefault(key, value)
+        except OSError:
+            continue
+        if primary is None:
+            primary, primary_baked = path, baked
+    return primary, primary_baked
+
+
+LOADED_DOTENV, DOTENV_IS_BAKED_INTO_APK = load_dotenv()
+
+
+def dotenv_warning() -> str:
+    """
+    تحذير صريح لو مفتاح التوليد جاي من ملف بيترفع جوه الـAPK.
+
+    الفحص ده مش تجميل: `app/build.gradle.kts` بيقرأ `.env` ويحط **كل** مفاتيحه
+    في `BuildConfig`، فمفتاح OpenRouter (أو الأسوأ: service_role) في ملف الجذر
+    يبقى مشفّر بس جوه الـAPK، وأي حد يفتح الـ APK ياخد مفتاح يدفع بفلوسه.
+    """
+    if not DOTENV_IS_BAKED_INTO_APK or not (LLM_API_KEY or SUPABASE_KEY):
+        return ""
+    which = "OPENROUTER_API_KEY" if LLM_API_KEY else "SUPABASE_SERVICE_ROLE_KEY"
+    return (
+        f"   ⚠️  {which} مقروء من {LOADED_DOTENV} — وده ملف بيتدهن في BuildConfig "
+        "جوه الـAPK. انقله لـ scripts/.env أو Secrets في CI."
+    )
+
+
+def _env(*names: str, default: str = "") -> str:
+    """أول متغير مضبوط يكسب — عشان OpenRouter/Gemini يتبادلوا بلا التباس."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+# ---------------------------------------------------------------------------
+# الإعدادات
+# ---------------------------------------------------------------------------
+
+SUPABASE_URL = _env("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = _env("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY")
+
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
+GEMINI_MODEL = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "{model}:generateContent"
 )
+
+# --- مزوّد LLM مفتوح (OpenRouter أو أي شيء يتكلم OpenAI-compatible) ---------
+# التصميم: مسار واحد `POST {base}/chat/completions` بيغطي OpenRouter و
+# Groq/Together/OpenAI/Neko/GitHub Models، عشان كده بنطلب JSON بالنص في
+# الـprompt (مش بـ response_format) — Response format مش مضمون في كل مزوّد،
+# والـparser بيتعامل مع الـfences والمقدمات النصية أصلاً.
+OPENROUTER_BASE_URL = _env(
+    "OPENROUTER_BASE_URL", "LLM_BASE_URL", default="https://openrouter.ai/api/v1"
+)
+LLM_PROVIDER = _env("LLM_PROVIDER", default="auto").strip().lower()
+LLM_API_KEY = _env("OPENROUTER_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY")
+# نموذج افتراضي مجاني — لازم يفضل :free عشان الـkey المجاني يشتغل من غير رصيد
+LLM_MODEL = _env("OPENROUTER_MODEL", "LLM_MODEL", default="google/gemini-2.5-flash-exp:free")
+LLM_TEMPERATURE = float(_env("LLM_TEMPERATURE", default="0.85"))
+LLM_MAX_TOKENS = int(_env("LLM_MAX_TOKENS", default="8000"))
+#: ترويسة بيحبها OpenRouter للتحليل؛ مابتغيرش السلوك
+LLM_APP_TITLE = _env("LLM_APP_TITLE", default="Malab El Tahaddi Question Bot")
+
+#: أقصى عدد طلبات LLM في التشغيل الواحد. الحد ده **أهم من الـdaily cap**:
+#: طبقة OpenRouter المجانية بترفض بعد 50 طلب/يوم (و20/دقيقة)، ولو سبناها
+#: من غير governor البوت يخلص الرصيد على محاولة واحدة فاشلة ويوقف باقي اليوم.
+LLM_MAX_REQUESTS_PER_RUN = int(_env("LLM_MAX_REQUESTS_PER_RUN", default="10"))
 
 TABLE_QUESTIONS = "questions"
 VIEW_FEED = "questions_feed"
@@ -524,6 +646,161 @@ def count_published_last_24h(game_type: Optional[str] = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# سياسة الصعوبة — «كام سهل / كام متوسط / كام صعب»
+# ---------------------------------------------------------------------------
+# مابقيناش نسيب النموذج يحدد لوحده لسببين: موديلات الطبقة المجانية بترجع
+# غالباً «medium» في كل حاجة (أأمن اختيار عندها)، واللعبة نفسها محتاجة
+# تدرّج عشان «30 ثانية» و«صباحو» ليهم صعوبة مختلفة في اللعب.
+#
+# الصيغ المقبولة في QUESTION_BOT_DIFFICULTY:
+#   mixed          → توزيع متوازن easy/medium/hard (الافتراضي)
+#   easy|medium|hard → كل الدفعة على مستوى واحد (بيُجبَر حرفياً)
+#   mostly_easy    → 50% سهل / 35% متوسط / 15% صعب
+#   mostly_hard    → 50% صعب / 35% متوسط / 15% سهل
+#   medium_hard    → نصين، من غير أسئلة سهلة
+#   easy=1,medium=2,hard=1 → أوزان صريحة
+
+DIFFICULTY_POLICY_RAW = _env("QUESTION_BOT_DIFFICULTY", default="mixed").strip().lower()
+
+_DIFFICULTY_PRESETS: Dict[str, Dict[str, int]] = {
+    "mixed": {"easy": 1, "medium": 1, "hard": 1},
+    "easy": {"easy": 1},
+    "medium": {"medium": 1},
+    "hard": {"hard": 1},
+    "mostly_easy": {"easy": 10, "medium": 7, "hard": 3},
+    "mostly_hard": {"hard": 10, "medium": 7, "easy": 3},
+    "medium_hard": {"medium": 1, "hard": 1},
+}
+
+
+def parse_difficulty_policy(raw: str) -> Dict[str, int]:
+    """`mixed`/preset/أوزان صريحة ← dict أوزان. أي حاجة مفهومة = mixed."""
+    raw = (raw or "").strip().lower()
+    if raw in _DIFFICULTY_PRESETS:
+        return dict(_DIFFICULTY_PRESETS[raw])
+
+    if "=" in raw:
+        weights: Dict[str, int] = {}
+        for part in raw.replace(";", ",").split(","):
+            key, sep, value = part.partition("=")
+            key = key.strip()
+            if not sep or key not in VALID_DIFFICULTIES:
+                continue
+            try:
+                weight = max(0, int(float(value.strip())))
+            except ValueError:
+                continue
+            if weight:
+                weights[key] = weight
+        if weights:
+            return weights
+
+    return dict(_DIFFICULTY_PRESETS["mixed"])
+
+
+#: سياسات preset أحادية القيمة = إجبار حرفي على كل سؤال في الدفعة.
+#: «mixed» والأوزان الصريحة = تخطيط للـprompt بس، لأن النموذج من حقه يغلط
+#: ونحنا بنفضّل سؤال بصعوبة مختلفة على إننا نرميه.
+FORCED_DIFFICULTY = (
+    next(iter(_DIFFICULTY_PRESETS[DIFFICULTY_POLICY_RAW]))
+    if DIFFICULTY_POLICY_RAW in ("easy", "medium", "hard")
+    else None
+)
+
+DIFFICULTY_WEIGHTS = parse_difficulty_policy(DIFFICULTY_POLICY_RAW)
+
+
+def plan_difficulties(count: int) -> List[str]:
+    """
+    توزيع صعوبات لدفعة حجمها `count` — deterministic وبنفس الوزن المطلوب.
+
+    بنوزّع بالباقي (مش بعشوائية) عشان الدفعة الصغيرة تفضل متوازنة: طلب 4
+    أسئلة بأوزان 1/1/1 يرجع easy/medium/hard/easy، مش easy×4.
+    """
+    if count <= 0:
+        return []
+    names = list(DIFFICULTY_WEIGHTS.keys())
+    weights = [DIFFICULTY_WEIGHTS[n] for n in names]
+    total = sum(weights)
+
+    plan: List[str] = []
+    while len(plan) < count:
+        for name, weight in zip(names, weights):
+            # نصيب المستوى ده من الدفعة، مع ضمان إن كل مستوى يظهر مرة على الأقل
+            share = max(1, round(count * weight / total)) if len(plan) < count else 0
+            plan.extend([name] * share)
+            if len(plan) >= count:
+                break
+    return plan[:count]
+
+
+def difficulty_prompt_line(plan: Sequence[str]) -> str:
+    """وصف human-readable للتوزيع المطلوب، بيحطه البوت في الـprompt."""
+    if not plan:
+        return ""
+    counts: Dict[str, int] = {}
+    for level in plan:
+        counts[level] = counts.get(level, 0) + 1
+    # بصيغة «سهل 2، متوسط 3» بدل «2 سهلة» — أقصر على النموذج وأسلم نحوياً،
+    # وبنرجّع ترتيب VALID_DIFFICULTIES عشان الـprompt يفضل ثابتاً بين التشغيلات
+    # (ده بيسهّل مقارنة اللوجات لو الموديل غيّر سلوكه).
+    pretty = {"easy": "سهل", "medium": "متوسط", "hard": "صعب"}
+    parts = [f"{pretty[lv]} {counts[lv]}" for lv in VALID_DIFFICULTIES if lv in counts]
+    return (
+        "التوزيع المطلوب للصعوبة: " + "، ".join(parts) + f" (من {len(plan)} سؤال). "
+        "اكتب \"difficulty\" لكل سؤال بالإنجليزي: easy/medium/hard، وما تغيّرش المستوى."
+    )
+
+
+def enforce_difficulty(policy_plan: Sequence[str], index: int, difficulty: str) -> str:
+    """
+    المستوى النهائي للسؤال:
+      - سياسة أحادية ⇒ نُجبرها (ضمان حقيقي مش رجاء).
+      - غير كده ⇒ ناخد قيمة النموذج لو صالحة، وإلا المستوى المخطط له.
+    """
+    if FORCED_DIFFICULTY:
+        return FORCED_DIFFICULTY
+    if difficulty in VALID_DIFFICULTIES:
+        return difficulty
+    if index < len(policy_plan):
+        return policy_plan[index]
+    return "medium"
+
+
+# ---------------------------------------------------------------------------
+# حارس عدد الطلبات — طبقة مجانية = حد يومي على عدد الطلبات
+# ---------------------------------------------------------------------------
+
+class RequestBudget:
+    """
+    عداد طلبات LLM للتشغيل الواحد.
+
+    ليه موجود؟ لأن الطبقة المجانية بحدّها بتفرق **عدد الطلبات** مش عدد
+    الأسئلة (50 طلب/يوم و20/دقيقة على OpenRouter)، ولو الدفعة كلها اترفضت
+    فيمكن نحرق 4 محاولات × 4 أنواع = 16 طلب في دقيقة. الحارس بيحوّل «تجاوز
+    الحد» لحالة معروفة بنسجّلها ونوقف بيها بهدوء، بدل 429 متكرر يخلص
+    رصيد اليوم قبل ما ينشر أي حاجة.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(0, limit)
+        self.used = 0
+
+    def acquire(self) -> bool:
+        if self.used >= self.limit:
+            return False
+        self.used += 1
+        return True
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+
+LLM_BUDGET = RequestBudget(LLM_MAX_REQUESTS_PER_RUN)
+
+
+# ---------------------------------------------------------------------------
 # توليد بـ Gemini
 # ---------------------------------------------------------------------------
 
@@ -564,15 +841,17 @@ def build_prompt(game_type: str, count: int, existing_samples: Sequence[str]) ->
             "\n\nدي أسئلة موجودة بالفعل — ماتكررش أفكارها ولا صياغتها:\n"
             + "\n".join(f"- {s}" for s in samples)
         )
+    difficulty_line = difficulty_prompt_line(plan_difficulties(count))
     return (
         f"أضف {count} سؤال جديد للنوع '{game_type}'. "
-        f"نوّع بين الصعوبات (سهل/متوسط/صعب) وبين المجالات. "
+        f"{difficulty_line} "
+        f"نوّع المجالات (تاريخ، أرقام قياسية، قوانين، جغرافيا ملاعب، منتخبات). "
         f"الرد JSON فقط بدون أي نص قبله أو بعده.{avoid}"
     )
 
 
 def gemini_generate(game_type: str, count: int, existing_samples: Sequence[str]) -> List[Dict[str, Any]]:
-    """استدعاء Gemini generateContent مع responseMimeType=json."""
+    """استدعاء Gemini generateContent الأصلي (responseMimeType=json)."""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY مش مضبوط — بنستخدم curated فقط")
 
@@ -596,6 +875,121 @@ def gemini_generate(game_type: str, count: int, existing_samples: Sequence[str])
     if not text:
         raise RuntimeError("Gemini رجع رد فاضي")
     return parse_questions_json(text)
+
+
+def resolve_provider() -> str:
+    """
+    أي مزوّد بنستخدم؟ `auto` = OpenRouter لو فيه مفتاح له، وإلا Gemini.
+
+    المنطق ده مبيتعملش مرة واحدة عند الـimport عشان الاختبارات تقدر تغيّر
+    الـenv وتعيد الحساب.
+    """
+    forced = LLM_PROVIDER
+    if forced in ("openrouter", "openai", "generic"):
+        return "openai"
+    if forced == "gemini":
+        return "gemini"
+    if LLM_API_KEY:
+        return "openai"
+    if GEMINI_API_KEY:
+        return "gemini"
+    return "none"
+
+
+def chat_completions_generate(
+    game_type: str, count: int, existing_samples: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """
+    توليد عبر أي endpoint متوافق مع OpenAI (OpenRouter افتراضياً).
+
+    ملاحظات على الاختيارات:
+      - `response_format` متروك عمدًا: مش كل مزوّد مجاني بيدعمه، و400 بسببه
+        يهدّي الدفعة كلها. `parse_questions_json` بيشيل ``` fences والنص
+        الزايد قبل JSON، فطلب JSON بالنص كفاية وأأمن.
+      - `max_tokens` كبير: 4-20 سؤال بعربي مشفّر بايتات كتير، والقطع في نص
+        JSON = رد غير صالح بالكامل.
+      - `stop` متروك: بعض المزوّدين بيحسبوه خطأ مع النصوص العربية.
+    """
+    if not LLM_API_KEY:
+        raise RuntimeError("مفيش OPENROUTER_API_KEY — بنستخدم curated فقط")
+
+    base = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
+    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+
+    payload = {
+        "model": LLM_MODEL,
+        "temperature": LLM_TEMPERATURE,
+        "max_tokens": LLM_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_prompt(game_type, count, existing_samples)},
+        ],
+    }
+    # OpenRouter بيطلب إعادة توجيه/عنوان للتصنيف؛ مش إجباري بس بيفيد في لوحة
+    # التحكم، وبنحطه بس لما نكون على OpenRouter فعلاً.
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    if "openrouter.ai" in url:
+        headers["HTTP-Referer"] = "https://github.com/hamama44/-"
+        headers["X-Title"] = LLM_APP_TITLE
+
+    body = http_json("POST", url, payload=payload, headers=headers, retries=3)
+
+    text = _extract_chat_text(body)
+    if not text:
+        raise RuntimeError(f"المزوّد رجع رد فاضي (model={LLM_MODEL})")
+    return parse_questions_json(text)
+
+
+def _extract_chat_text(body: Any) -> str:
+    """
+    استخراج نص الرد من شكل OpenAI.
+
+    بنمرّر على `choices[0].message.content` و`.text` و`[{"type":"text"}]`
+    لأن المزوّدين المجانيين بيرجعوا أشكال مختلفة شوية، وده أرخص مكان نتحمّل
+    فيه الاختلاف بدل ما نرمي رد صحيح كـ«فاضي».
+    """
+    if not isinstance(body, dict):
+        return ""
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first, dict) else None
+
+    candidates: List[Any] = []
+    if isinstance(message, dict):
+        candidates.append(message.get("content"))
+        # بعض المزوّدين بيرجعوا قائمة أجزاء
+        content = message.get("content")
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+            )
+    candidates.append(first.get("text"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return ""
+
+
+def generate_questions(
+    game_type: str, count: int, existing_samples: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """نقطة الدخول الوحيدة للتوليد — بتوزّع على المزوّد وبتحرس الميزانية."""
+    provider = resolve_provider()
+    if provider == "none":
+        raise RuntimeError("مفيش مفتاح LLM (OpenRouter أو Gemini) — بنستخدم curated فقط")
+    if not LLM_BUDGET.acquire():
+        raise RuntimeError(
+            f"ميزانية الطلبات خلصت ({LLM_MAX_REQUESTS_PER_RUN} طلب للتشغيل) — "
+            "بنوقف بهدوء عشان ما نحرقش حد اليوم المجاني"
+        )
+    if provider == "gemini":
+        return gemini_generate(game_type, count, existing_samples)
+    return chat_completions_generate(game_type, count, existing_samples)
 
 
 def _extract_gemini_text(body: Any) -> str:
@@ -811,6 +1205,7 @@ def collect_for_game_type(
     existing: Sequence[Dict[str, Any]],
     log: List[str],
 ) -> Tuple[List[Dict[str, Any]], int]:
+    """`use_gemini` معناها «استخدم الـLLM» — المزوّد نفسه بيحدده `resolve_provider`."""
     """يولّد (أو ياخد من curated) لحد ما يلمّى `wanted` سؤال صالح، ويرفض الباقي.
 
     لو Gemini رجع أسئلة كلها مرفوضة، بنستنى تاني مرة — بحد أقصى
@@ -833,22 +1228,30 @@ def collect_for_game_type(
             continue
         cleaned["__answer"] = answer
         cleaned["source"] = "curated"
+        if FORCED_DIFFICULTY:
+            cleaned["difficulty"] = FORCED_DIFFICULTY
         accepted.append(cleaned)
 
     if len(accepted) >= wanted or not use_gemini:
         return accepted, rejected_count
 
-    # 2) توليد Gemini للباقي
+    # 2) توليد الـLLM للباقي
     remaining = wanted - len(accepted)
     samples = [str(r.get("question") or "") for r in existing if r.get("question")]
     for attempt in range(MAX_GENERATION_ATTEMPTS):
         if len(accepted) >= wanted:
             break
         batch_size = min(remaining + 4, 20)  # نفخّ شوية عشان الرفض الطبيعي
+        plan = plan_difficulties(batch_size)
         try:
-            rows = gemini_generate(game_type, batch_size, samples)
+            rows = generate_questions(game_type, batch_size, samples)
         except (RuntimeError, Rejected) as error:
             log.append(f"  توليد {game_type} فشل (محاولة {attempt + 1}): {error}")
+            # تجاوز حد الطلبات مش حالة نعيد فيها المحاولة: بنقفل الدفعة كلها
+            # عشان ما نكملش حرق الطلبات بعد أول 429.
+            if "ميزانية الطلبات" in str(error):
+                log.append(f"  ⏹️ إيقاف توليد {game_type}: الميزانية خلصت")
+                break
             time.sleep(1.5)
             continue
 
@@ -864,6 +1267,9 @@ def collect_for_game_type(
                 continue
             cleaned["__answer"] = answer
             cleaned["source"] = "bot"
+            cleaned["difficulty"] = enforce_difficulty(
+                plan, len(accepted) % max(1, len(plan)), str(cleaned.get("difficulty") or "")
+            )
             accepted.append(cleaned)
 
         remaining = wanted - len(accepted)
@@ -885,6 +1291,9 @@ def run(
     started = time.time()
     log: List[str] = []
     print(f"▶️  سؤال بوت V3 — الحد اليومي {DAILY_CAP} | dry_run={dry_run}")
+    warning = dotenv_warning()
+    if warning:
+        print(warning)
 
     curated = load_curated(curated_path)
     if curated:
@@ -892,9 +1301,26 @@ def run(
     else:
         print("   مفيش ملف curated — هيعتمد على التوليد لو متاح")
 
-    if use_gemini and not GEMINI_API_KEY:
-        print("   ⚠️  GEMINI_API_KEY مش موجود — هيتخطى التوليد")
+    # الميزانية بتتبداً من الصفر كل تشغيل: الـglobal بيتشارك فيه كل الأنواع
+    # الأربعة في نفس الـprocess، ودي الطريقة الوحيدة نضمن بيها إن إجمالي
+    # الطلبات تحت حد المزوّد مش لكل نوع على حدة.
+    LLM_BUDGET.used = 0
+
+    provider = resolve_provider()
+    if use_gemini and provider == "none":
+        print(
+            "   ⚠️  مفيش OPENROUTER_API_KEY ولا GEMINI_API_KEY — "
+            "هيتخطى التوليد ويعتمد على curated بس"
+        )
         use_gemini = False
+    elif use_gemini:
+        where = f"{LLM_MODEL} @ {OPENROUTER_BASE_URL}" if provider == "openai" else f"{GEMINI_MODEL} @ google"
+        print(f"   🧠 مزوّد التوليد: {provider} — {where}")
+        print(
+            f"   📊 سياسة الصعوبة: {DIFFICULTY_POLICY_RAW} → "
+            f"{DIFFICULTY_WEIGHTS} (إجبار: {FORCED_DIFFICULTY or 'لأ'})"
+        )
+        print(f"   🎛️  ميزانية الطلبات في التشغيل ده: {LLM_BUDGET.limit}")
 
     total_accepted: List[Dict[str, Any]] = []
     total_rejected = 0
@@ -1163,6 +1589,85 @@ def self_test() -> int:
         for item in failures:
             print(f"   - {item}")
         return 1
+    # --- سياسة الصعوبة (QUESTION_BOT_DIFFICULTY) ---
+    check("preset mixed = 3 مستويات", parse_difficulty_policy("mixed") == {"easy": 1, "medium": 1, "hard": 1})
+    check("preset غير معروف → mixed", parse_difficulty_policy("خرافية") == {"easy": 1, "medium": 1, "hard": 1})
+    check("أوزان صريحة", parse_difficulty_policy("easy=1,medium=2,hard=1") == {"easy": 1, "medium": 2, "hard": 1})
+    check("أوزان تتجاهل مفتاح غلط",
+          parse_difficulty_policy("easy=1,nope=9") == {"easy": 1})
+    check("صعوبة أحادية بتصفّي الأوزان", parse_difficulty_policy("hard") == {"hard": 1})
+
+    plan = plan_difficulties(6)
+    check("التوزيع بيغطي العدد المطلوب", len(plan) == 6)
+    check("التوزيع المتوازن بيشمل التلات مستويات", set(plan) == {"easy", "medium", "hard"})
+    check("count=0 → فاضي", plan_difficulties(0) == [])
+
+    with_counts = plan_difficulties(4)
+    check(
+        "دفعة صغيرة مابتسبورش مستوى whole",
+        len(with_counts) == 4 and len(set(with_counts)) >= 2,
+    )
+
+    # enforce: السياسة الأحادية بتجبّر حتى لو النموذج خالف
+    saved_forced = globals()["FORCED_DIFFICULTY"]
+    globals()["FORCED_DIFFICULTY"] = "hard"
+    check("إجبار أحادية", enforce_difficulty(["easy"], 0, "easy") == "hard")
+    globals()["FORCED_DIFFICULTY"] = None
+    check("في mixed نسيب قيمة النموذج الصالحة",
+          enforce_difficulty(["easy"], 0, "medium") == "medium")
+    check("قيمة غير صالحة → المستوى المخطط له",
+          enforce_difficulty(["hard"], 0, "لاشيء") == "hard")
+    globals()["FORCED_DIFFICULTY"] = saved_forced
+
+    line = difficulty_prompt_line(["easy", "easy", "hard"])
+    check("سطر الـprompt بيشمل العدد العربي والإنجليزي",
+          "سهل 2" in line and "صعب 1" in line and "difficulty" in line)
+    check("الترتيب ثابت (easy قبل medium قبل hard)",
+          line.index("سهل") < line.index("متوسط") if "متوسط" in line else True)
+
+    # --- حارس الميزانية ---
+    budget = RequestBudget(2)
+    check("أول طلبين وعد", budget.acquire() and budget.acquire())
+    check("التالت مرفوض", not budget.acquire())
+    check("remaining = 0", budget.remaining == 0)
+    budget.used = 0
+    check("إعادة الضبط بترجّع الحق", budget.acquire())
+    check("limit سالب → مفيش طلبات خالص", not RequestBudget(0).acquire())
+
+    # --- استخراج رد OpenAI-compatible ---
+    check(
+        "message.content نص",
+        _extract_chat_text({"choices": [{"message": {"content": "{\"questions\":[]}"}}]})
+        == '{"questions":[]}',
+    )
+    check(
+        "message.content قائمة أجزاء (شائع في مزوّدين مجانيين)",
+        _extract_chat_text({"choices": [{"message": {"content": [{"type": "text", "text": "مرحبا"}]}}]})
+        == "مرحبا",
+    )
+    check("first.text كبديل", _extract_chat_text({"choices": [{"text": "hi"}]}) == "hi")
+    check("رد مهشّم → فاضي مش انفجار", _extract_chat_text({"choices": []}) == "")
+    check("body مش dict → فاضي", _extract_chat_text("oops") == "")
+
+    # --- resolve_provider / .env ---
+    saved_provider = globals()["LLM_PROVIDER"]
+    globals()["LLM_PROVIDER"] = "openrouter"
+    check("provider صريح openrouter → openai", resolve_provider() == "openai")
+    globals()["LLM_PROVIDER"] = "gemini"
+    check("provider صريح gemini", resolve_provider() == "gemini")
+    globals()["LLM_PROVIDER"] = "auto"
+    check(
+        "auto بيفضّل المفتاح العام لو موجود",
+        resolve_provider() == ("openai" if LLM_API_KEY else ("gemini" if GEMINI_API_KEY else "none"))
+    )
+    globals()["LLM_PROVIDER"] = saved_provider
+
+    cands = _dotenv_candidates()
+    check("مسارات .env نسبية (مافيهاش مسار مطلق يابس)",
+          all(not os.path.isabs(rel) for rel, _ in _DOTENV_SOURCES) and len(cands) == len(_DOTENV_SOURCES))
+    check("scripts/.env مش متعلّم كملف بيتدهن في الـAPK",
+          _DOTENV_SOURCES[0][1] is False and _DOTENV_SOURCES[1][1] is True)
+
     print("✅ كل الاختبارات المدمجة عدّت")
     return 0
 
@@ -1177,7 +1682,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="أقصى عدد أسئلة لكل نوع في التشغيل (افتراضي 6)")
     parser.add_argument("--dry-run", action="store_true",
                         help="يطبع اللي هينشر من غير ما يكتب في القاعدة")
-    parser.add_argument("--source", choices=("both", "gemini", "curated"), default="both")
+    parser.add_argument("--source", choices=("both", "gemini", "llm", "openrouter", "curated"),
+                        default="both", help="llm/openrouter = نفس المعنى بتاع gemini (حسب --provider)")
+    parser.add_argument("--provider", choices=("auto", "openrouter", "gemini"), default=None,
+                        help="المزوّد؛ auto = OpenRouter لو فيه مفتاح له وإلا Gemini")
+    parser.add_argument("--model", default=None, help="اسم الموديل (بيدهس OPENROUTER_MODEL/GEMINI_MODEL)")
+    parser.add_argument("--base-url", default=None, help="base URL للـchat completions")
+    parser.add_argument("--api-key", default=None, help="مفتاح الـAPI للمزوّد المفتوح")
+    parser.add_argument("--difficulty", default=None,
+                        help="mixed | easy | medium | hard | mostly_easy | mostly_hard | medium_hard | easy=1,medium=2,hard=1")
     parser.add_argument("--curated", default=os.path.join(os.path.dirname(__file__), "questions_curated.json"))
     parser.add_argument("--game-types", default=",".join(VALID_GAME_TYPES))
     parser.add_argument("--self-test", action="store_true", help="يشغّل الاختبارات المدمجة ويقف")
@@ -1191,7 +1704,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("❌ مفيش نوع سؤال صالح في --game-types", file=sys.stderr)
         return 2
 
-    use_gemini = args.source in ("both", "gemini")
+    global LLM_PROVIDER, LLM_MODEL, OPENROUTER_BASE_URL, LLM_API_KEY, \
+        DIFFICULTY_POLICY_RAW, DIFFICULTY_WEIGHTS, FORCED_DIFFICULTY
+
+    if args.provider:
+        LLM_PROVIDER = args.provider
+    if args.model:
+        LLM_MODEL = args.model
+        # لو الموديل صريح ومفيش مفتاح عام، نجرب ناخد مفتاح Gemini لو هو المطلوب
+    if args.base_url:
+        OPENROUTER_BASE_URL = args.base_url
+    if args.api_key:
+        LLM_API_KEY = args.api_key
+    if args.difficulty:
+        DIFFICULTY_POLICY_RAW = args.difficulty.strip().lower()
+        DIFFICULTY_WEIGHTS = parse_difficulty_policy(DIFFICULTY_POLICY_RAW)
+        FORCED_DIFFICULTY = (
+            DIFFICULTY_POLICY_RAW if DIFFICULTY_POLICY_RAW in VALID_DIFFICULTIES else None
+        )
+
+    use_gemini = args.source in ("both", "gemini", "llm", "openrouter")
     try:
         return run(
             limit=max(1, args.limit),
