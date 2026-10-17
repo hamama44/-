@@ -9,9 +9,14 @@ import com.example.audio.StadiumAudioEffects
 import com.example.data.*
 import com.example.data.room.CumulativePlayerStat
 import com.example.data.room.GameHighScoreStat
+import com.example.data.room.GameRoom
+import com.example.data.room.GameRoomRepository
 import com.example.data.room.OfflineRepository
 import com.example.data.room.OfflineSyncResult
 import com.example.data.room.PartyLeaderboardRecordEntity
+import com.example.data.room.RoomParticipant
+import com.example.data.room.failureMessageOrNull
+import com.example.data.room.getOrNull
 import com.example.data.daily.DailyChallenge
 import com.example.data.daily.DailyChallengeManager
 import com.example.data.ai.GeminiSpeechAuditor
@@ -30,6 +35,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -75,6 +81,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     val dailyChallengeManager = DailyChallengeManager(application)
     val voicePermissionRepository = VoicePermissionRepository(application)
     val speechToTextManager = SpeechToTextManager(application)
+
+    /** مستودع الغرف الأونلاين: DAO محلي (Room) + DAO بعيد (Supabase). */
+    val gameRoomRepository = GameRoomRepository.get(application)
 
     private val _dailyChallenge = MutableStateFlow(dailyChallengeManager.getTodayChallenge())
     val dailyChallenge: StateFlow<DailyChallenge> = _dailyChallenge.asStateFlow()
@@ -416,6 +425,161 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
     fun dismissLastSyncResult() {
         offlineRepository.dismissLastSyncResult()
+    }
+
+    // =========================================================================
+    // ONLINE GAME ROOMS: إنشاء الغرف وقائمة المشاركين (Supabase + كاش محلي)
+    // =========================================================================
+    /**
+     * قائمة الغرف من الكاش المحلي عبر Flow (Offline-first).
+     * إذا كانت القائمة فارغة نعرض غرفاً تجريبية حتى تبقى الشاشة حيّة بدون سيرفر.
+     */
+    val onlineRooms: StateFlow<List<GameRoom>> = gameRoomRepository.observeRooms()
+        .map { rooms -> if (rooms.isEmpty()) demoOnlineRooms() else rooms }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), demoOnlineRooms())
+
+    private val _onlineRoomParticipants = MutableStateFlow<List<RoomParticipant>>(emptyList())
+    val onlineRoomParticipants: StateFlow<List<RoomParticipant>> = _onlineRoomParticipants.asStateFlow()
+
+    private val _selectedRoomCode = MutableStateFlow<String?>(null)
+    val selectedRoomCode: StateFlow<String?> = _selectedRoomCode.asStateFlow()
+
+    private val _isLoadingParticipants = MutableStateFlow(false)
+    val isLoadingParticipants: StateFlow<Boolean> = _isLoadingParticipants.asStateFlow()
+
+    private val _isRoomActionBusy = MutableStateFlow(false)
+    val isRoomActionBusy: StateFlow<Boolean> = _isRoomActionBusy.asStateFlow()
+
+    private val _roomActionMessage = MutableStateFlow<String?>(null)
+    val roomActionMessage: StateFlow<String?> = _roomActionMessage.asStateFlow()
+
+    private val _lastCreatedRoomCode = MutableStateFlow<String?>(null)
+    val lastCreatedRoomCode: StateFlow<String?> = _lastCreatedRoomCode.asStateFlow()
+
+    /** كود مقترح يظهر في حوار الإنشاء، ويتأكد المستودع من فرادته قبل الاعتماد. */
+    private val _roomPreviewCode = MutableStateFlow(gameRoomRepository.generateRoomCode())
+    val roomPreviewCode: StateFlow<String> = _roomPreviewCode.asStateFlow()
+
+    fun regenerateRoomCodePreview() {
+        _roomPreviewCode.value = gameRoomRepository.generateRoomCode()
+    }
+
+    fun dismissRoomActionMessage() {
+        _roomActionMessage.value = null
+    }
+
+    /** سحب أحدث الغرف من Supabase وتحديث الكاش المحلي. */
+    fun loadOnlineRooms(limit: Int = GameRoomRepository.DEFAULT_FETCH_LIMIT) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            gameRoomRepository.refreshRooms(limit)
+            _isRoomActionBusy.value = false
+        }
+    }
+
+    /** إنشاء غرفة جديدة باسم المضيف الحالي وإضافته كأول مشارك. */
+    fun createOnlineRoom(gameType: String, preferredCode: String?) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            val profile = repository.userProfile.value
+            val result = gameRoomRepository.createRoom(
+                hostName = profile.playerName,
+                gameType = gameType,
+                hostAvatar = profile.avatarEmoji,
+                preferredCode = preferredCode
+            )
+            _isRoomActionBusy.value = false
+
+            val room = result.getOrNull()
+            if (room != null) {
+                audioEffects.playWhistle()
+                _lastCreatedRoomCode.value = room.roomCode
+                _roomPreviewCode.value = gameRoomRepository.generateRoomCode()
+                _roomActionMessage.value = if (room.isOfflineOnly) {
+                    "تم إنشاء الغرفة (${room.roomCode}) محلياً 📴 ستُزامَن مع السيرفر تلقائياً"
+                } else {
+                    "تم إنشاء الغرفة (${room.roomCode}) بنجاح ⚽ شارك الكود مع أصحابك"
+                }
+                _selectedRoomCode.value = room.roomCode
+                loadParticipants(room.roomCode)
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = result.failureMessageOrNull() ?: "تعذّر إنشاء الغرفة ⛔"
+            }
+        }
+    }
+
+    /** انضمام لاعب لغرفة بكودها، ثم [onJoined] عند النجاح. */
+    fun joinOnlineRoom(roomCode: String, onJoined: () -> Unit = {}) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            val profile = repository.userProfile.value
+            val result = gameRoomRepository.joinRoom(
+                roomCode = roomCode,
+                playerName = profile.playerName,
+                avatarEmoji = profile.avatarEmoji
+            )
+            _isRoomActionBusy.value = false
+
+            val room = result.getOrNull()
+            if (room != null) {
+                audioEffects.playWhistle()
+                _selectedRoomCode.value = room.roomCode
+                _roomActionMessage.value = "انضممت إلى الغرفة (${room.roomCode}) 🎮"
+                loadParticipants(room.roomCode)
+                onJoined()
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = result.failureMessageOrNull() ?: "تعذّر الانضمام للغرفة ⛔"
+            }
+        }
+    }
+
+    /** فتح قائمة مشاركي غرفة (من السيرفر مع رجوع تلقائي للكاش). */
+    fun openRoomParticipants(roomCode: String) {
+        audioEffects.playClick()
+        _selectedRoomCode.value = roomCode
+        viewModelScope.launch { loadParticipants(roomCode) }
+    }
+
+    fun refreshRoomParticipants() {
+        val code = _selectedRoomCode.value ?: return
+        viewModelScope.launch { loadParticipants(code) }
+    }
+
+    fun closeRoomParticipants() {
+        _selectedRoomCode.value = null
+        _onlineRoomParticipants.value = emptyList()
+    }
+
+    private suspend fun loadParticipants(roomCode: String) {
+        _isLoadingParticipants.value = true
+        val result = gameRoomRepository.listParticipants(roomCode)
+        _onlineRoomParticipants.value = result.getOrNull().orEmpty()
+        _isLoadingParticipants.value = false
+    }
+
+    /** تبديل جاهزية مشارك ثم تحديث القائمة. */
+    fun toggleParticipantReady(participant: RoomParticipant) {
+        viewModelScope.launch {
+            gameRoomRepository.setParticipantReady(
+                roomCode = participant.roomCode,
+                playerName = participant.playerName,
+                isReady = !participant.isReady
+            )
+            loadParticipants(participant.roomCode)
+        }
+    }
+
+    /** دفع الغرف والمشاركين المُنشأة أوفلاين إلى Supabase. */
+    fun syncPendingOnlineRooms() {
+        viewModelScope.launch {
+            val synced = gameRoomRepository.syncPendingRooms()
+            if (synced > 0) {
+                audioEffects.playCorrect()
+                _roomActionMessage.value = "تمت مزامنة $synced غرفة مع السيرفر ☁️"
+            }
+        }
     }
 
     // =========================================================================
@@ -2640,6 +2804,43 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 // -----------------------------------------------------------------------------
 // PRIVATE HELPER FUNCTIONS
 // -----------------------------------------------------------------------------
+/**
+ * غرف تجريبية تُعرض عندما لا توجد غرف حقيقية (سيرفر غير مُهيّأ أو قائمة فارغة)،
+ * حتى تبقى شاشة "غرف اللعب" حيّة وقابلة للتجربة.
+ */
+private fun demoOnlineRooms(): List<GameRoom> = listOf(
+    GameRoom(
+        roomCode = "STAD99",
+        hostName = "كابتن ساري ⚽",
+        gameType = "thirty_seconds",
+        status = com.example.data.room.RoomStatus.WAITING,
+        participantCount = 3,
+        maxPlayers = 6,
+        region = "MENA",
+        createdAtMillis = System.currentTimeMillis() - 60_000
+    ),
+    GameRoom(
+        roomCode = "BUZZ22",
+        hostName = "فارس الكالتشيو 🇮🇹",
+        gameType = "buzzer",
+        status = com.example.data.room.RoomStatus.WAITING,
+        participantCount = 2,
+        maxPlayers = 4,
+        region = "GULF",
+        createdAtMillis = System.currentTimeMillis() - 180_000
+    ),
+    GameRoom(
+        roomCode = "GRID33",
+        hostName = "البروفيسور 🧠",
+        gameType = "tictactoe",
+        status = com.example.data.room.RoomStatus.PLAYING,
+        participantCount = 2,
+        maxPlayers = 2,
+        region = "NAfrica",
+        createdAtMillis = System.currentTimeMillis() - 420_000
+    )
+)
+
 private fun generateChallengeCode(): String {
     val prefixes = listOf("CHAMP", "KICK", "TAHADDI", "MADRID", "BARCA", "CAPTAIN", "GOAL", "LEGEND")
     val num = (1000..9999).random()

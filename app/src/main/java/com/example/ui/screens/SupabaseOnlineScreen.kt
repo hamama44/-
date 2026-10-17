@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.example.data.room.RoomParticipant
 import com.example.data.supabase.*
 import com.example.ui.FootballGameViewModel
 import com.example.ui.GameScreen
@@ -36,7 +37,6 @@ import com.example.ui.components.GlowCard
 import com.example.ui.components.StadiumTopBar
 import com.example.ui.theme.*
 import kotlinx.coroutines.launch
-import kotlin.random.Random
 
 @Composable
 fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
@@ -50,9 +50,14 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     var isConfigured by remember { mutableStateOf(SupabaseConfig.isConfigured) }
     var showConfigDialog by remember { mutableStateOf(false) }
 
-    // Rooms state
-    var activeRooms by remember { mutableStateOf<List<SupabaseGameRoom>>(emptyList()) }
-    var isLoadingRooms by remember { mutableStateOf(false) }
+    // Rooms state — كلها عبر GameRoomRepository (Supabase + كاش Room محلي)
+    val activeRooms by viewModel.onlineRooms.collectAsState()
+    val isLoadingRooms by viewModel.isRoomActionBusy.collectAsState()
+    val roomPreviewCode by viewModel.roomPreviewCode.collectAsState()
+    val roomActionMessage by viewModel.roomActionMessage.collectAsState()
+    val selectedRoomCode by viewModel.selectedRoomCode.collectAsState()
+    val roomParticipants by viewModel.onlineRoomParticipants.collectAsState()
+    val isLoadingParticipants by viewModel.isLoadingParticipants.collectAsState()
     var showCreateRoomDialog by remember { mutableStateOf(false) }
     var showJoinRoomDialog by remember { mutableStateOf(false) }
 
@@ -61,34 +66,8 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     var isLoadingScores by remember { mutableStateOf(false) }
 
     fun refreshRooms() {
-        scope.launch {
-            isLoadingRooms = true
-            val rooms = supabaseClient.fetchActiveGameRooms()
-            activeRooms = if (rooms.isNotEmpty()) rooms else listOf(
-                SupabaseGameRoom(
-                    id = "mock_1",
-                    roomCode = "STAD99",
-                    gameType = "thirty_seconds",
-                    status = "waiting",
-                    hostName = "كابتن ساري ⚽"
-                ),
-                SupabaseGameRoom(
-                    id = "mock_2",
-                    roomCode = "BUZZ22",
-                    gameType = "buzzer",
-                    status = "waiting",
-                    hostName = "فارس الكالتشيو 🇮🇹"
-                ),
-                SupabaseGameRoom(
-                    id = "mock_3",
-                    roomCode = "GRID33",
-                    gameType = "tictactoe",
-                    status = "waiting",
-                    hostName = "البروفيسور 🧠"
-                )
-            )
-            isLoadingRooms = false
-        }
+        // المستودع يجلب من Supabase ويحدّث الكاش؛ والقائمة تُراقَب عبر Flow في الـ ViewModel
+        viewModel.loadOnlineRooms()
     }
 
     fun refreshScores() {
@@ -105,9 +84,20 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     }
 
     LaunchedEffect(Unit) {
+        SupabaseClientProvider.initialize(context)
         SupabaseConfig.init(context)
         isConfigured = SupabaseConfig.isConfigured
         refreshRooms()
+        // دفع أي غرف/مشاركين أُنشئت أوفلاين في جلسة سابقة
+        viewModel.syncPendingOnlineRooms()
+    }
+
+    // أي رسالة من المستودع (نجاح/فشل) تُعرض مرة واحدة كـ Toast
+    LaunchedEffect(roomActionMessage) {
+        roomActionMessage?.let { message ->
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            viewModel.dismissRoomActionMessage()
+        }
     }
 
     Scaffold(
@@ -279,13 +269,7 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         items(activeRooms) { room ->
-                            val gameTitle = when (room.gameType) {
-                                "thirty_seconds" -> "تحدي الثلاثين ⏱️"
-                                "buzzer" -> "صراع الجرس 🔔"
-                                "tictactoe" -> "تيك تاك تو كروي ⚽"
-                                "auction" -> "المزاد الكروي 🔨"
-                                else -> "تحدي مباشر ⚽"
-                            }
+                            val gameTitle = room.arabicGameTitle
 
                             Card(
                                 modifier = Modifier
@@ -321,29 +305,57 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                         }
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
-                                            text = "المضيف: ${room.hostName} • الحالة: ${if (room.status == "waiting") "في انتظار منافس ⏳" else "جارية ⚽"}",
+                                            text = "المضيف: ${room.hostName} • ${room.arabicStatusLabel}",
                                             fontSize = 11.sp,
                                             color = TextSecondary
                                         )
+                                        Text(
+                                            text = if (room.isOfflineOnly) {
+                                                "${room.capacityLabel} • محفوظة محلياً بانتظار المزامنة 📴"
+                                            } else {
+                                                "${room.capacityLabel} • جولة ${room.currentRound}/${room.maxRounds}"
+                                            },
+                                            fontSize = 10.sp,
+                                            color = if (room.isFull) TrophyGold else StadiumCyan
+                                        )
                                     }
 
-                                    Button(
-                                        onClick = {
-                                            viewModel.audioEffects.playWhistle()
-                                            // Launch corresponding game for PvP match
-                                            when (room.gameType) {
-                                                "thirty_seconds" -> viewModel.startThirtySecondsQuiz()
-                                                "buzzer" -> viewModel.navigateTo(GameScreen.ThirtySecondsRoundsScreen)
-                                                "tictactoe" -> viewModel.navigateTo(GameScreen.FootballTicTacToeScreen)
-                                                "auction" -> viewModel.navigateTo(GameScreen.FootballAuctionScreen)
-                                                else -> viewModel.startPvPMatchSearch()
-                                            }
-                                        },
-                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
-                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                                        shape = RoundedCornerShape(8.dp)
-                                    ) {
-                                        Text("دخول 🎮", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Button(
+                                            onClick = {
+                                                viewModel.audioEffects.playWhistle()
+                                                // Launch corresponding game for PvP match
+                                                when (room.gameType) {
+                                                    "thirty_seconds" -> viewModel.startThirtySecondsQuiz()
+                                                    "buzzer" -> viewModel.navigateTo(GameScreen.ThirtySecondsRoundsScreen)
+                                                    "tictactoe" -> viewModel.navigateTo(GameScreen.FootballTicTacToeScreen)
+                                                    "auction" -> viewModel.navigateTo(GameScreen.FootballAuctionScreen)
+                                                    else -> viewModel.startPvPMatchSearch()
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
+                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text("دخول 🎮", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        }
+
+                                        Spacer(modifier = Modifier.height(6.dp))
+
+                                        OutlinedButton(
+                                            onClick = { viewModel.openRoomParticipants(room.roomCode) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Group,
+                                                contentDescription = null,
+                                                tint = StadiumCyan,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("المشاركون 👥", color = StadiumCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
                                     }
                                 }
                             }
@@ -526,7 +538,6 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     // -------------------------------------------------------------------------
     if (showCreateRoomDialog) {
         var selectedGameType by remember { mutableStateOf("thirty_seconds") }
-        val generatedCode = remember { "STAD${Random.nextInt(10, 99)}" }
 
         Dialog(onDismissRequest = { showCreateRoomDialog = false }) {
             Card(
@@ -550,11 +561,21 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(text = "كود الغرفة للمشاركة:", fontSize = 12.sp, color = TextSecondary)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = roomPreviewCode,
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = TrophyGold
+                        )
+                        IconButton(onClick = { viewModel.regenerateRoomCodePreview() }, modifier = Modifier.size(32.dp)) {
+                            Icon(Icons.Default.Refresh, contentDescription = "توليد كود آخر", tint = StadiumCyan)
+                        }
+                    }
                     Text(
-                        text = generatedCode,
-                        fontSize = 28.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = TrophyGold
+                        text = "يتأكد المستودع من فرادة الكود قبل الإنشاء ✓",
+                        fontSize = 10.sp,
+                        color = TextSecondary
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -586,19 +607,16 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                     Spacer(modifier = Modifier.height(18.dp))
 
                     EmeraldButton(
-                        text = "تأكيد وبدء الغرفة 🚀",
+                        text = if (isLoadingRooms) "جارٍ إنشاء الغرفة..." else "تأكيد وبدء الغرفة 🚀",
                         onClick = {
-                            scope.launch {
-                                val newRoom = SupabaseGameRoom(
-                                    roomCode = generatedCode,
-                                    gameType = selectedGameType,
-                                    hostName = userProfile.playerName
-                                )
-                                supabaseClient.createGameRoom(newRoom)
-                                showCreateRoomDialog = false
-                                refreshRooms()
-                                Toast.makeText(context, "تم إنشاء الغرفة ($generatedCode) بنجاح!", Toast.LENGTH_SHORT).show()
-                            }
+                            // المستودع: توليد/اعتماد كود فريد ← إنشاء في Supabase ← كاش محلي
+                            //          ← إضافة المضيف كأول مشارك
+                            viewModel.createOnlineRoom(
+                                gameType = selectedGameType,
+                                preferredCode = roomPreviewCode
+                            )
+                            showCreateRoomDialog = false
+                            refreshRooms()
                         },
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -648,8 +666,10 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         onClick = {
                             if (inputRoomCode.isNotBlank()) {
                                 showJoinRoomDialog = false
-                                viewModel.audioEffects.playWhistle()
-                                viewModel.startPvPMatchSearch()
+                                // فحص السعة والتكرار + موازنة الفرق تلقائياً داخل المستودع
+                                viewModel.joinOnlineRoom(inputRoomCode) {
+                                    viewModel.startPvPMatchSearch()
+                                }
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -743,6 +763,200 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         Icon(Icons.Default.ContentCopy, contentDescription = null, tint = TrophyGold)
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("نسخ كود SQL Schema الجاهز 📋", color = TrophyGold, fontSize = 12.sp)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // مخطط V2: جداول/واجهات Users • Rooms • Leaderboard
+                    OutlinedButton(
+                        onClick = {
+                            val sqlCode = context.assets.open("supabase_schema_v2.sql").bufferedReader().use { it.readText() }
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Supabase Schema V2", sqlCode))
+                            Toast.makeText(context, "تم نسخ مخطط V2 (Users/Rooms/Leaderboard)! الصقه في Supabase SQL Editor 📋", Toast.LENGTH_LONG).show()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, tint = StadiumCyan)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("نسخ مخطط V2: Users/Rooms/Leaderboard 📋", color = StadiumCyan, fontSize = 12.sp)
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = SupabaseClientProvider.describeStatus(),
+                        fontSize = 10.sp,
+                        color = TextSecondary
+                    )
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ROOM PARTICIPANTS DIALOG — قائمة المشاركين عبر GameRoomRepository
+    // -------------------------------------------------------------------------
+    if (selectedRoomCode != null) {
+        RoomParticipantsDialog(
+            roomCode = selectedRoomCode ?: "",
+            participants = roomParticipants,
+            isLoading = isLoadingParticipants,
+            currentUserName = userProfile.playerName,
+            onReadyToggle = { participant -> viewModel.toggleParticipantReady(participant) },
+            onRefresh = { viewModel.refreshRoomParticipants() },
+            onDismiss = { viewModel.closeRoomParticipants() }
+        )
+    }
+}
+
+@Composable
+private fun RoomParticipantsDialog(
+    roomCode: String,
+    participants: List<RoomParticipant>,
+    isLoading: Boolean,
+    currentUserName: String,
+    onReadyToggle: (RoomParticipant) -> Unit,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val redCount = participants.count { it.isTeamRed }
+    val blueCount = participants.size - redCount
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = PitchCard),
+            shape = RoundedCornerShape(16.dp),
+            border = androidx.compose.foundation.BorderStroke(1.5.dp, StadiumCyan)
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "مشاركو الغرفة ($roomCode) 👥",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "🔴 أحمر: $redCount   •   🔵 أزرق: $blueCount",
+                    fontSize = 11.sp,
+                    color = TrophyGold,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                when {
+                    isLoading -> {
+                        CircularProgressIndicator(color = StadiumCyan, modifier = Modifier.size(34.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text("جارٍ تحميل المشاركين من السيرفر...", fontSize = 11.sp, color = TextSecondary)
+                    }
+
+                    participants.isEmpty() -> {
+                        Text(
+                            text = "لا يوجد مشاركون بعد — شارك الكود مع أصحابك ⚽",
+                            fontSize = 12.sp,
+                            color = TextSecondary,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
+                    else -> {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 320.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(participants) { participant ->
+                                val isCurrentUser = participant.playerName.trim()
+                                    .equals(currentUserName.trim(), ignoreCase = true)
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(PitchDark)
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                        Text(text = participant.avatarEmoji, fontSize = 20.sp)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = participant.playerName,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    fontSize = 13.sp
+                                                )
+                                                if (participant.isHost) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(text = "👑 مضيف", fontSize = 10.sp, color = TrophyGold)
+                                                }
+                                                if (isCurrentUser) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(text = "(أنت)", fontSize = 10.sp, color = EmeraldNeon)
+                                                }
+                                            }
+                                            Text(
+                                                text = "${participant.arabicTeamLabel} • ${participant.arabicReadyLabel} • ${participant.score} نقطة",
+                                                fontSize = 10.sp,
+                                                color = TextSecondary
+                                            )
+                                        }
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = { onReadyToggle(participant) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text(
+                                            text = if (participant.isReady) "إلغاء الجاهزية" else "أنا جاهز ✅",
+                                            fontSize = 10.sp,
+                                            color = if (participant.isReady) TextSecondary else EmeraldNeon
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onRefresh,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, tint = StadiumCyan, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("تحديث 🔄", color = StadiumCyan, fontSize = 12.sp)
+                    }
+
+                    Button(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = TrophyGold),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("إغلاق", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
                 }
             }
