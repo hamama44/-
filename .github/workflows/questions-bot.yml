@@ -25,25 +25,41 @@ name: Question Bot (إضافة أسئلة تلقائياً)
 #   │ LLM_PROVIDER               auto | openrouter | gemini          (اختياري)
 #   │ QUESTION_BOT_DIFFICULTY    mixed | easy | medium | hard |
 #   │                            mostly_easy | mostly_hard | medium_hard
-#   │ QUESTION_BOT_DAILY_CAP     25
+#   │ QUESTION_BOT_DAILY_CAP     250
+#   │ QUESTION_BOT_AUTO_PUBLISH  true (=false → pending للمراجعة)
 #   └──────────────────────────────────────────────────────────────────────
 #
 # ومطلوب مرة واحدة كمان: نفّذ supabase_schema_v3.sql في Supabase SQL Editor.
 #
 # ===========================================================================
-#كام سؤال وبياكل كام دقيقة؟ (GitHub Free = 2000 دقيقة/شهر للريبو الخاص)
-#   - الجدول ده 4 تشغيلات/يوم = ~120 تشغيل/شهر.
-#   - كل تشغيل: checkout + setup-python ≈ 25 ثانية، و1–8 طلبات توليد
-#     (5–20 ثانية للطلب)، وفحص تكرار + نشر ≈ 10 ثواني ⇒ **~1.5–2 دقيقة**.
-#   - 120 × 2 د = **~240 دقيقة/شهر = 12% من الـ2000** ⇒ مفيش أي مشكلة.
-#     (ولو الريبو Public، دقايق Linux runners أصلاً بلا حد.)
-#   - المحصول مش بتحدده الدقايق، ده بيتحدد من:
-#       1) QUESTION_BOT_DAILY_CAP = 25/يوم  ⇒ **سقف ~750 سؤال/شهر** ← المهيمن
-#       2) معدل رفض التدقيق (30–60%) ⇒ **الواقعي ~300–500 سؤال/شهر**
-#       3) حد OpenRouter المجاني = **50 طلب/يوم**: كل طلب بيرجع حتى 20 سؤال،
-#          فحد الطلبات بيسمح بنظرية بـ~1000 سؤال/يوم — مش هو العنق.
-#          الحارس LLM_MAX_REQUESTS_PER_RUN=10 × 4 تشغيلات = 40 طلب/يوم ⇒ تحت
-#          الـ50 بأمان. ⚠️ لو زوّدت عدد التشغيلات في اليوم نزّل الرقم ده.
+# 250 سؤال/يوم — الأرقام اللي مشتغلة على بعضها (GitHub Free = 2000 دقيقة/شهر)
+#
+#   التوزيع: 18 سؤال/نوع × 4 أنواع × 4 تشغيلات = **288** مرشّح، والسقف 250
+#   بيوقف الزيادة لوحده (الميزانية بتتقسم على الأنواع، فالآخر بييجي 250 بالظبط).
+#
+#   الطلبات — دي العملة الحقيقية على الطبقة المجانية (50 طلب/يوم، 20/دقيقة).
+#   الرقم مش تنظير: قِسته بسيرفر mock بيطابق شكل OpenRouter:
+#     تشغيل كامل بالأنواع الأربعة (limit=16) = **4 طلبات** (طلب لكل نوع،
+#     الدفعة 22 مرشّح رجّعت 15-16 صالح) ⇒ 16 طلب/يوم.
+#     في الواقع التدقيق بيرفض 20-45% ⇒ 2-3 محاولات/نوع ⇒ 8-12 طلب/تشغيل
+#     ⇒ **32-48 طلب/يوم** — تحت الـ50، وحارس LLM_MAX_REQUESTS_PER_RUN=12
+#     بيوقف أي تشغيل يزيد عنها. ⚠️ متزوّدش عدد التشغيلات من غير ما تنزّله.
+#
+#   الدقايق: 4-12 طلب × 20-35 ثانية + نشر متقطّع (chunk=25) ⇒ **~3-4 د/تشغيل**.
+#     120 تشغيل/شهر × 4 د = **~480 دقيقة/شهر = 24% من الـ2000** ✅
+#     ولو الريبو Public: دقايق Linux runners بلا حد أصلاً.
+#     ولو الريبو Public: دقايق Linux runners أصلاً بلا حد.
+#
+#   القاعدة: 250 × 30 = 7500 صف/شهر ≈ 4MB ⇒ مafeh problem في Supabase Free (500MB
+#     = ~3 سنين شغل). فحص التكرار بقى بيقرا البصمات كلها + 800 نص حديث، فمش
+#     هينفخ اللوج ولا هيفوّت مكررات قديمة لما الجدول يكبر.
+#   التطبيق: بيقرا 90 سؤال/نوع في المزامنة (أكتر من يوم نشر كامل) ⇒ اللاعب
+#     بيشوف الجديد فعلًا مش بس الجدول.
+#
+#   ⚠️ اللي السقف العالي بيغيّره: التدقيق بيمسك **الصيغة** مش **صحة المعلومة**.
+#     مع 250/يوم من غير مراجعة هتدخل إجابات غلط. لو ده مقلّقك:
+#     vars → QUESTION_BOT_AUTO_PUBLISH=false فتتخزن pending، وتراجعها في
+#     Supabase Studio وتوافق عليها دفعة واحدة (اللاعب ما بيقراش غير published).
 # ===========================================================================
 
 on:
@@ -53,9 +69,9 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "أقصى عدد أسئلة لكل نوع في التشغيل"
+        description: "أقصى عدد أسئلة لكل نوع في التشغيل (18 × 4 أنواع × 4 تشغيلات = 288، والسقف 250 يقطع الزيادة)"
         required: false
-        default: "6"
+        default: "18"
         type: string
       dry_run:
         description: "طباعة النتيجة من غير نشر (true/false)"
@@ -119,11 +135,23 @@ jobs:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
 
       # --- سياسة المحتوى ---
-      QUESTION_BOT_DAILY_CAP: ${{ vars.QUESTION_BOT_DAILY_CAP || '25' }}
+      # السقف اليومي في البوت نفسه، فحتى لو الـcron اتشغّل زيادة مايفخّش الجدول
+      QUESTION_BOT_DAILY_CAP: ${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}
+      # ⚠️ صمّام الأمان: false ⇒ الأسئلة تتخزن pending فتفضل مخزّنة ومابتوصلش
+      # اللاعب (الـview والتطبيق بيقرا published بس). مع 250/يوم من غير مراجعة
+      # ده الخيار اللي بيحمي اللعبة من معلومة مخترعة؛ الافتراضي true احتراماً
+      # لاختيارك «نشر تلقائي + سقف».
+      QUESTION_BOT_AUTO_PUBLISH: ${{ vars.QUESTION_BOT_AUTO_PUBLISH || 'true' }}
       QUESTION_BOT_DIFFICULTY: ${{ vars.QUESTION_BOT_DIFFICULTY }}
-      # حارس حد الطلبات المجاني (50/يوم). لو زوّدت عدد التشغيلات في اليوم،
-      # نزّل الرقم ده عشان 4 تشغيلات × 10 = 40 طلب < 50.
-      LLM_MAX_REQUESTS_PER_RUN: ${{ vars.LLM_MAX_REQUESTS_PER_RUN || '10' }}
+      # حارس حد الطلبات المجاني (50/يوم): 4 تشغيلات × 12 = 48 < 50.
+      # ⚠️ لو زوّت عدد التشغيلات في اليوم لازم تنزّل الرقم ده.
+      LLM_MAX_REQUESTS_PER_RUN: ${{ vars.LLM_MAX_REQUESTS_PER_RUN || '12' }}
+      # حجم دفعة التوليد: طلب واحد بيرجع ~22 مرشح، فـ250 سؤال/يوم بياخد
+      # ~32 طلب/يوم. لو نزّلته لـ20 (القديم) هتحتاج ضعف الطلبات وتضرب الحد.
+      LLM_MAX_BATCH: ${{ vars.LLM_MAX_BATCH || '40' }}
+      LLM_MAX_TOKENS: ${{ vars.LLM_MAX_TOKENS || '20000' }}
+      LLM_TIMEOUT_SECONDS: ${{ vars.LLM_TIMEOUT_SECONDS || '120' }}
+      LLM_MAX_ATTEMPTS: ${{ vars.LLM_MAX_ATTEMPTS || '8' }}
 
     steps:
       - name: سحب الكود
@@ -198,7 +226,12 @@ jobs:
             echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
             echo "- الموديل: \`${{ github.event.inputs.model || vars.LLM_MODEL || 'google/gemini-2.5-flash-exp:free' }}\`"
             echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mixed (سهل/متوسط/صعب بالتناوب)' }}\`"
-            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '25' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '10' }}\`"
+            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '12' }}\` · دفعة التوليد: \`${{ vars.LLM_MAX_BATCH || '40' }}\`"
+            if [ "${{ vars.QUESTION_BOT_AUTO_PUBLISH }}" = "false" ]; then
+              echo "- وضع النشر: **pending للمراجعة** — مabiوصلش اللاعب لحد ما توافق 📝"
+            else
+              echo "- وضع النشر: تلقائي للاعيبين 🚀"
+            fi
             echo ""
             if [ -n "$OPENROUTER_API_KEY" ]; then
               echo "- التوليد: OpenRouter ✅"

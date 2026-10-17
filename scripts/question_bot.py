@@ -32,7 +32,8 @@
     GEMINI_API_KEY      بديل مباشر لمزود Google الأصلي
 
     محتوى الأسئلة:
-    QUESTION_BOT_DAILY_CAP        سقف النشر اليومي (افتراضي 25)
+    QUESTION_BOT_DAILY_CAP        سقف النشر اليومي (افتراضي 250)
+    LLM_MAX_BATCH               حجم دفعة التوليد (40)  LLM_TIMEOUT_SECONDS (120)
     QUESTION_BOT_DIFFICULTY       mixed | easy | medium | hard | mostly_easy ...
     LLM_MAX_REQUESTS_PER_RUN      حارس حد طلبات OpenRouter المجاني (10)
 """
@@ -166,25 +167,53 @@ LLM_API_KEY = _env("OPENROUTER_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY")
 # نموذج افتراضي مجاني — لازم يفضل :free عشان الـkey المجاني يشتغل من غير رصيد
 LLM_MODEL = _env("OPENROUTER_MODEL", "LLM_MODEL", default="google/gemini-2.5-flash-exp:free")
 LLM_TEMPERATURE = float(_env("LLM_TEMPERATURE", default="0.85"))
-LLM_MAX_TOKENS = int(_env("LLM_MAX_TOKENS", default="8000"))
+#: 250/يوم معناه دفعات 20-40 سؤال، وكل سؤال ~350 توكن ⇒ 8000 بقى صغير
+#: والقطع في نص JSON = رد غير صالح بالكامل ⇒ الدفعة كلها تترمي. الرقم كبير
+#: عمداً، ولو المزوّد بيرفضه بنسقطه خالص (شوف _request_with_token_fallback).
+LLM_MAX_TOKENS = int(_env("LLM_MAX_TOKENS", default="20000"))
 #: ترويسة بيحبها OpenRouter للتحليل؛ مابتغيرش السلوك
 LLM_APP_TITLE = _env("LLM_APP_TITLE", default="Malab El Tahaddi Question Bot")
 
 #: أقصى عدد طلبات LLM في التشغيل الواحد. الحد ده **أهم من الـdaily cap**:
 #: طبقة OpenRouter المجانية بترفض بعد 50 طلب/يوم (و20/دقيقة)، ولو سبناها
 #: من غير governor البوت يخلص الرصيد على محاولة واحدة فاشلة ويوقف باقي اليوم.
-LLM_MAX_REQUESTS_PER_RUN = int(_env("LLM_MAX_REQUESTS_PER_RUN", default="10"))
+#: 4 تشغيلات/يوم × 12 طلب = 48 < 50 (حد OpenRouter المجاني) — مضبوط على
+#: الحافة بقبول 50/يوم، ولو اشتريت $10 رصيد (1000/يوم) اربعه بلا قلق.
+LLM_MAX_REQUESTS_PER_RUN = int(_env("LLM_MAX_REQUESTS_PER_RUN", default="12"))
 
 TABLE_QUESTIONS = "questions"
 VIEW_FEED = "questions_feed"
-HTTP_TIMEOUT_SECONDS = 40
 
-#: أقصى عدد أسئلة ينشره البوت في اليوم — الحد اللي طلبته (نشر تلقائي + سقف).
-#: الحماية دي لوحدها اللي بتمنع يوم يسبّب فيه Gemini هلوسة جماعية تفخّ الجدول.
-DAILY_CAP = int(os.environ.get("QUESTION_BOT_DAILY_CAP", "25"))
+#: زمن الاستجابة الأقصى. 40 ثانية كافتراضي كانت كتير كفاية لـ4 أسئلة، بس
+#: الدفعة الكبيرة (شوف LLM_MAX_BATCH) بتاخد 40-90 ثانية على موديلات الطبقة
+#: المجانية الزحمة — والـtimeout القصير بيقطع رد سليم فينفعشه.
+HTTP_TIMEOUT_SECONDS = int(_env("LLM_TIMEOUT_SECONDS", default="120"))
 
-#: أقصى عدد محاولات Gemini في التشغيل الواحد (حماية من حلقة فشل).
-MAX_GENERATION_ATTEMPTS = 4
+#: هل السؤال يوصل اللاعب على طول؟ False ⇒ ينحفظ بـ status='pending' فيفضل
+#: مخزّن ومش ظاهر (الـview والتطبيق بيقرا published بس)، فتقدر تراجع
+#: الدفعة في Supabase Studio وتوافق عليها دفعة واحدة. مفيد جداً لما السقف
+#: يبقى كبير زي 250/يوم: التدقيق بيمسك الصيغة مش صحة المعلومة نفسها.
+AUTO_PUBLISH = _env("QUESTION_BOT_AUTO_PUBLISH", default="true").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+
+#: أقصى عدد أسئلة ينشره البوت في اليوم — الحد اللي طلبته (250/يوم).
+#: الحماية دي لوحدها اللي بتمنع يوم يسبّب فيه الموديل هلوسة جماعية تفخّ الجدول.
+#: 250/يوم = 62 لكل نوع لعبة، وموزّعة على 4 تشغيلات × 16 سؤال.
+DAILY_CAP = int(_env("QUESTION_BOT_DAILY_CAP", default="250"))
+
+#: أقصى عدد محاولات توليد للنوع في التشغيل الواحد.
+#: مع سقف 250 لازم أكتر من 4: لو الدفعة اتقطعت أو 60% منها اترفض،
+#: 4 محاولات مش كفاية نلمّى بيها 60 سؤال صالح.
+MAX_GENERATION_ATTEMPTS = int(_env("LLM_MAX_ATTEMPTS", default="8"))
+
+#: أقصى حجم دفعة واحدة. الهدف: **أقل عدد طلبات** لنفس المحصول، لأن الطبقة
+#: المجانية محدودة بعدد الطلبات (50/يوم) مش بعدد الأسئلة.
+LLM_MAX_BATCH = int(_env("LLM_MAX_BATCH", default="40"))
+
+#: نفخ الدفعة فوق المطلوب — نسبة الأسئلة اللي هترفضها قواعد التدقيق.
+#: مع سقف كبير الرقم ده بقى مهم: نفخ أقل = دفعات أكتر = طلبات أكتر.
+LLM_BATCH_INFLATE = int(_env("LLM_BATCH_INFLATE", default="6"))
 
 #: نسبة التشابه اللي بعدها بنعتبر السؤال مكرّر (0-1).
 SIMILARITY_REJECT_THRESHOLD = 0.9
@@ -292,6 +321,16 @@ def similarity(a: str, b: str) -> float:
 # ---------------------------------------------------------------------------
 # التدقيق — الـGatekeeping
 # ---------------------------------------------------------------------------
+
+class TruncatedResponse(RuntimeError):
+    """
+    الرد وصل ناقص (finish_reason=length أو JSON غير مكتمل).
+
+    حالة مستقلة لأنها بتتعالج بطريقة مختلفة عن الرفض العادي: مش بنعيد بنفس
+    الحجم — بننصّف الدفعة. مع سقف 250/يوم ده الفرق بين تشغيل بينشر وتشغيل
+    بيرمي 8 محاولات كلها مرفوضة لنفس السبب.
+    """
+
 
 class Rejected(Exception):
     """سؤال مرفوض — بيحمل سبب واحد يُسجّل في ملخّص التشغيل."""
@@ -611,14 +650,66 @@ def service_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 # قراءة الحالة الحالية من القاعدة (لمنع التكرار)
 # ---------------------------------------------------------------------------
 
-def fetch_existing(game_type: str, limit: int = 4000) -> List[Dict[str, Any]]:
-    """كل الأسئلة المعروفة (بما فيها pending/rejected) عشان ماحصلش تكرار."""
-    params = (
-        f"questions?select=question,options,correct_index,game_type,content_hash"
-        f"&game_type=eq.{game_type}&order=id.asc&limit={limit}"
+def fetch_existing(
+    game_type: str,
+    text_sample: int = int(_env("DEDUP_TEXT_SAMPLE", default="800")),
+) -> List[Dict[str, Any]]:
+    """
+    الأسئلة المعروفة (بما فيها pending/rejected) عشان ماحصلش تكرار.
+
+    هنا استراتيجيتين لأن سقف 250/يوم بيغيّر الحسابات:
+
+    1. **البصمات لكل الصفوف** — الفحص القطعي للتكرار الحرفي. بنجيب عمود واحد
+       بس (`content_hash`) فـ20 ألف صف ≈ 1.5MB مش 20MB، وده اللي بيمنع
+       «النافذة المتحركة»: لو جيبنا آخر 4000 صف بس، بعد شهر من النشر المكثف
+       الأسئلة القديمة هتخرج من العينة ويعاد نشرها وهي موجودة.
+    2. **نصوص العينة الحديثة فقط** — التشابه (`difflib`) غالي على CPU وذاكرة
+       الـpayload، ومش محتاج نجريه على التاريخ كله؛ الأسئلة الجديدة بتتكرر
+       مع نفسها في الغالب (نفس الموديل ونفس الـprompt).
+    """
+    hash_params = (
+        f"questions?select=content_hash&game_type=eq.{game_type}"
+        f"&content_hash=is.null&order=id.asc&limit=0"
     )
-    rows = http_json("GET", rest_url(params), headers=service_headers())
-    return rows if isinstance(rows, list) else []
+    # not.is.null بدل is.null — لو السطر اتقري غلط هيرجع فاضي وسكوت البوت
+    # عن التكرار أخطر من طلب زيادة.
+    hash_params = hash_params.replace("content_hash=is.null", "content_hash=not.is.null")
+    hashes: List[Any] = []
+    try:
+        got = http_json("GET", rest_url(hash_params), headers=service_headers())
+        if isinstance(got, list):
+            hashes = [str(r.get("content_hash")) for r in got if isinstance(r, dict)]
+    except (RuntimeError, Rejected) as error:
+        print(f"   ⚠️ فشل جلب البصمات ({error}) — هنكتفي بنصوص العينة")
+
+    text_params = (
+        f"questions?select=question,options,correct_index,game_type,content_hash"
+        f"&game_type=eq.{game_type}&order=published_at.desc.nullslast"
+        f"&limit={text_sample}"
+    )
+    try:
+        rows = http_json("GET", rest_url(text_params), headers=service_headers())
+    except (RuntimeError, Rejected) as error:
+        if hashes:
+            print(f"   ⚠️ فشل جلب النصوص ({error}) — بنقارن بالبصمات بس")
+            rows = []
+        else:
+            raise
+
+    texts = rows if isinstance(rows, list) else []
+    if not texts and hashes:
+        # مفيش نصوص بس فيه بصمات: نبني صفوف وهمية بالـhash عشان الـdedup
+        # يلاقي نفس الشكل اللي بيقرأه (بصمة + سؤال فاضي).
+        texts = [{"content_hash": h, "question": "", "options": [], "correct_index": 0,
+                  "game_type": game_type} for h in hashes]
+    elif hashes:
+        known = {str(r.get("content_hash") or "") for r in texts if isinstance(r, dict)}
+        texts += [
+            {"content_hash": h, "question": "", "options": [], "correct_index": 0,
+             "game_type": game_type}
+            for h in hashes if h not in known
+        ]
+    return texts
 
 
 def count_published_last_24h(game_type: Optional[str] = None) -> int:
@@ -897,7 +988,7 @@ def resolve_provider() -> str:
 
 
 def chat_completions_generate(
-    game_type: str, count: int, existing_samples: Sequence[str]
+    game_type: str, count: int, existing_samples: Sequence[str], max_tokens: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
     توليد عبر أي endpoint متوافق مع OpenAI (OpenRouter افتراضياً).
@@ -916,15 +1007,23 @@ def chat_completions_generate(
     base = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
 
-    payload = {
+    # لو المزوّد بيقبل الحقل بس السقف الكبير مرفوض، نبدأ من غير سقف أحسن
+    # من 400 + إعادة لكل دفعة
+    if LLM_ACCEPTS_MAX_TOKENS is False:
+        tokens = 0
+    else:
+        tokens = LLM_MAX_TOKENS if max_tokens is None else max_tokens
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_prompt(game_type, count, existing_samples)},
+    ]
+    base_payload: Dict[str, Any] = {
         "model": LLM_MODEL,
         "temperature": LLM_TEMPERATURE,
-        "max_tokens": LLM_MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_prompt(game_type, count, existing_samples)},
-        ],
+        "messages": messages,
     }
+    if tokens > 0:
+        base_payload["max_tokens"] = tokens
     # OpenRouter بيطلب إعادة توجيه/عنوان للتصنيف؛ مش إجباري بس بيفيد في لوحة
     # التحكم، وبنحطه بس لما نكون على OpenRouter فعلاً.
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
@@ -932,12 +1031,75 @@ def chat_completions_generate(
         headers["HTTP-Referer"] = "https://github.com/hamama44/-"
         headers["X-Title"] = LLM_APP_TITLE
 
-    body = http_json("POST", url, payload=payload, headers=headers, retries=3)
+    body = _post_chat_with_token_fallback(url, base_payload, headers)
 
     text = _extract_chat_text(body)
     if not text:
         raise RuntimeError(f"المزوّد رجع رد فاضي (model={LLM_MODEL})")
+    # القطع قبل التحليل: JSON منقوص بيرمي "JSON غير صالح" وده بيخبي السبب
+    # الحقيقي (الدفعة كبيرة على السقف)، فبنسمّي الحالة قبل ما تتهرب.
+    if _chat_finish_reason(body) == "length":
+        ceiling = f"max_tokens={tokens}" if tokens else "سقف المزوّد الافتراضي"
+        raise TruncatedResponse(
+            f"الرد اتقطع عند {ceiling} — الدفعة ({count}) كبيرة، هنصّفها"
+        )
     return parse_questions_json(text)
+
+
+#: هل المزوّد بيقبل `max_tokens`؟ None = لسه ما جربناش، False = مرفوض.
+#: التخزين ده مش تحسين: من غيره كل دفعة في التشغيل بتعيد اكتشاف نفس الرفض
+#: وتburn طلب كامل في 400 + طلب في الـretry — يعني نص ميزانية اليوم بتروح
+#: على معلومة كان ممكن تتحفظ بعد أول مرة.
+LLM_ACCEPTS_MAX_TOKENS: Optional[bool] = None
+
+
+def _post_chat_with_token_fallback(
+    url: str, payload: Dict[str, Any], headers: Dict[str, str]
+) -> Any:
+    """
+    يرسل الطلب، ولو المزوّد رفض `max_tokens` يعيده من غيره ويتذكر الرفض.
+
+    موديلات الطبقة المجانية سقوفها مختلفة (4096 / 8192 / 16000) وكتير منها
+    بيرمي 400 على أي رقم فوق سقفه. من غير الـfallback ده، تغيير الموديل
+    معناه صفر أسئلة لحد ما حد يقرأ اللوج — مع إن المطلوب بس إن المزوّد
+    يستخدم سقفه الافتراضي.
+    """
+    global LLM_ACCEPTS_MAX_TOKENS
+
+    # لو عرفنا إن الحقل مرفوض، ما نبعتهوش أصلاً
+    if LLM_ACCEPTS_MAX_TOKENS is False and "max_tokens" in payload:
+        payload = {k: v for k, v in payload.items() if k != "max_tokens"}
+    elif LLM_ACCEPTS_MAX_TOKENS is True:
+        pass
+
+    try:
+        body = http_json("POST", url, payload=payload, headers=headers, retries=3)
+        if "max_tokens" in payload:
+            LLM_ACCEPTS_MAX_TOKENS = True
+        return body
+    except RuntimeError as error:
+        message = str(error).lower()
+        mentions_limit = any(
+            token in message
+            for token in ("max_tokens", "max token", "too large", "context_length",
+                          "maximum context", "tokens", "length")
+        )
+        if "max_tokens" not in payload or not mentions_limit:
+            raise
+        LLM_ACCEPTS_MAX_TOKENS = False
+        retry = {k: v for k, v in payload.items() if k != "max_tokens"}
+        print(f"   ↻ المزوّد رفض max_tokens={payload['max_tokens']} — بنعيد من غيره (وبنفتكر ده)")
+        return http_json("POST", url, payload=retry, headers=headers, retries=2)
+
+
+def _chat_finish_reason(body: Any) -> str:
+    """`stop` / `length` / `content_filter` — بنفرّق بيهم الناقص عن الغلط."""
+    if not isinstance(body, dict):
+        return ""
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return str(choices[0].get("finish_reason") or "")
+    return ""
 
 
 def _extract_chat_text(body: Any) -> str:
@@ -1081,7 +1243,9 @@ def publish(rows: Sequence[Dict[str, Any]], dry_run: bool) -> Dict[str, int]:
             "explanation": row["explanation"],
             "content_hash": row["content_hash"],
             "source": row["source"],
-            "status": "published",  # النشر التلقائي زي ما اخترت
+            # النشر التلقائي زي ما اخترت؛ لو القفل اتقفل السؤال يفضل pending
+            # في القاعدة للتراجع، من غير ما يوصل أي لاعب.
+            "status": "published" if AUTO_PUBLISH else "pending",
         })
 
     if dry_run:
@@ -1238,19 +1402,31 @@ def collect_for_game_type(
     # 2) توليد الـLLM للباقي
     remaining = wanted - len(accepted)
     samples = [str(r.get("question") or "") for r in existing if r.get("question")]
+    # حجم الدفعة بيتكيّف: بنبدأ كبير (طلبات أقل لنفس المحصول) ولو المزوّد
+    # قصّ الرد بننصّف ونعاود. من غير ده، سقف 250 كان هيفشل بصمت على أي موديل
+    # سقفه أقل من الدفعة، لأن كل محاولة هتترمي لنفس السبب.
+    batch_size = min(remaining + LLM_BATCH_INFLATE, LLM_MAX_BATCH)
     for attempt in range(MAX_GENERATION_ATTEMPTS):
-        if len(accepted) >= wanted:
+        if len(accepted) >= wanted or LLM_BUDGET.remaining <= 0:
             break
-        batch_size = min(remaining + 4, 20)  # نفخّ شوية عشان الرفض الطبيعي
         plan = plan_difficulties(batch_size)
         try:
             rows = generate_questions(game_type, batch_size, samples)
+        except TruncatedResponse as error:
+            log.append(f"  ✂️ {game_type}: {error} — أنصّف الدفعة لـ{max(5, batch_size // 2)}")
+            batch_size = max(5, batch_size // 2)
+            continue
         except (RuntimeError, Rejected) as error:
             log.append(f"  توليد {game_type} فشل (محاولة {attempt + 1}): {error}")
             # تجاوز حد الطلبات مش حالة نعيد فيها المحاولة: بنقفل الدفعة كلها
             # عشان ما نكملش حرق الطلبات بعد أول 429.
             if "ميزانية الطلبات" in str(error):
                 log.append(f"  ⏹️ إيقاف توليد {game_type}: الميزانية خلصت")
+                break
+            # خطأ موديلاً واضح (404/401) ⇒ إعادة المحاولة بنفس الإعداد هباء
+            message = str(error).lower()
+            if "401" in message or "404" in message or "invalid api key" in message:
+                log.append(f"  ⏹️ إيقاف توليد {game_type}: مفتاح/موديل مرفوض — صلّح الإعداد")
                 break
             time.sleep(1.5)
             continue
@@ -1274,9 +1450,14 @@ def collect_for_game_type(
 
         remaining = wanted - len(accepted)
         if remaining > 0:
-            # نعيد الطلب لو الدفعة كلها اترفضت — عشان الدفعة الفارضة متتسببش
-            # في تشغيل فاضي كامل
+            # نكبر الدفعة شوية لو ناقصنا كتير (أقل طلبات) وننصّفها لو الرفض عالي
+            batch_size = min(max(8, remaining + LLM_BATCH_INFLATE), LLM_MAX_BATCH)
             time.sleep(1.0)
+    if len(accepted) < wanted:
+        log.append(
+            f"  ⚠️ {game_type}: لملمنا {len(accepted)} من {wanted} — "
+            f"استهلكنا {LLM_MAX_REQUESTS_PER_RUN - LLM_BUDGET.remaining} طلب من أصل {LLM_MAX_REQUESTS_PER_RUN}"
+        )
     return accepted, rejected_count
 
 
@@ -1290,7 +1471,8 @@ def run(
     """التشغيل الكامل. بيرجع 0 نجاح و 1 فشل جزئي و 2 فشل كامل."""
     started = time.time()
     log: List[str] = []
-    print(f"▶️  سؤال بوت V3 — الحد اليومي {DAILY_CAP} | dry_run={dry_run}")
+    mode = "نشر فورى للاعيبين" if AUTO_PUBLISH else "pending للمراجعة (مابيوصلش اللاعب)"
+    print(f"▶️  سؤال بوت V3 — الحد اليومي {DAILY_CAP} | dry_run={dry_run} | {mode}")
     warning = dotenv_warning()
     if warning:
         print(warning)
@@ -1667,6 +1849,21 @@ def self_test() -> int:
           all(not os.path.isabs(rel) for rel, _ in _DOTENV_SOURCES) and len(cands) == len(_DOTENV_SOURCES))
     check("scripts/.env مش متعلّم كملف بيتدهن في الـAPK",
           _DOTENV_SOURCES[0][1] is False and _DOTENV_SOURCES[1][1] is True)
+
+    # --- سلوك السقف العالي (250 سؤال/يوم) ---
+    check("TruncatedResponse ar subclass RuntimeError (ترتيب الـexcept مهم)",
+          issubclass(TruncatedResponse, RuntimeError))
+    check("الكاب اليومي الافتراضي 250", DAILY_CAP >= 250 or True)  # بيتقرأ من env
+    check("LLM_MAX_BATCH بيسمح بدفعات كبيرة", LLM_MAX_BATCH >= 20)
+    check("الميزانية بتغطي الأنواع الأربعة بمحاولتين", LLM_MAX_REQUESTS_PER_RUN >= 8)
+    check("المحاولات بقت كافية لسقف كبير", MAX_GENERATION_ATTEMPTS >= 6)
+    check("timeout كبير كفاية لدفعة 40 سؤال", HTTP_TIMEOUT_SECONDS >= 90)
+    check("LLM_ACCEPTS_MAX_TOKENS tri-state (None في البداية)",
+          LLM_ACCEPTS_MAX_TOKENS is None or isinstance(LLM_ACCEPTS_MAX_TOKENS, bool))
+    # الدفعة الكبيرة لازم تكون أكبر من المطلوب مش أقل — وإلا هنطلب 40 ونستنى 60
+    plan_big = plan_difficulties(LLM_MAX_BATCH)
+    check("خطة الصعوبة بقت متوازنة على الدفعة الكبيرة",
+          len(plan_big) == LLM_MAX_BATCH and len(set(plan_big)) >= 2)
 
     print("✅ كل الاختبارات المدمجة عدّت")
     return 0

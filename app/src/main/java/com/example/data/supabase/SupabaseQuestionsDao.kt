@@ -67,7 +67,15 @@ class SupabaseQuestionsDao(private val api: SupabaseApi) {
         const val VIEW_FEED = "questions_feed"
 
         /** افتراضي لكل نوع — كفاية جولة كاملة من غير ما نفخّ الـpayload. */
-        const val DEFAULT_LIMIT = 60
+        /**
+         * أقصى عدد سؤال بيقراه التطبيق لكل نوع في المزامنة.
+         *
+         * 90 مش رقم عشوائي: البوت منشّر 250 سؤال/يوم على 4 أنواع ⇒
+         * ~62 سؤال جديد لكل نوع كل يوم. الحد 60 كان يعني إن اللاعب يفوّت
+         * جزء من يوم النشر كله. 90 = يوم ونص من المحتوى الجديد، ولسه
+         * استعلام خفيف (صف واحد = ~1KB).
+         */
+        const val DEFAULT_LIMIT = 90
 
         /** الأنواع اللي ليها شاشة في التطبيق. */
         val DEFAULT_TYPES: Map<String, Int> = mapOf(
