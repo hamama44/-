@@ -1,6 +1,8 @@
 package com.example.data.room
 
 import android.content.Context
+import com.example.data.lan.LanGameManager
+import com.example.data.lan.MultiTransportRoomsDataSource
 import com.example.data.supabase.SupabaseClientProvider
 import com.example.data.supabase.SupabaseRoomsDao
 import kotlinx.coroutines.flow.Flow
@@ -542,9 +544,20 @@ class GameRoomRepository(
             val appContext = context.applicationContext
             val api = SupabaseClientProvider.initialize(appContext)
             val database = AppDatabase.getDatabase(appContext)
+            LanGameManager.initialize(appContext)
+
             return GameRoomRepository(
                 localDao = database.gameRoomDao(),
-                remoteDao = SupabaseRoomsDao(api)
+                // موجّه النقل: بيروح للهوتسبوت لو فيه جلسة محلية نشطة، وإلا للسحابة
+                remoteDao = MultiTransportRoomsDataSource(
+                    supabase = SupabaseRoomsDao(api),
+                    lan = LanGameManager.lanDataSource(),
+                    lanAvailable = { LanGameManager.isLanActive() }
+                ),
+                // الشبكة المحلية تُعتبر "متصلة" حتى بدون إنترنت إطلاقاً.
+                // من غير السطر ده المستودع هيتخطى كل النداءات البعيدة في وضع
+                // الهوتسبوت ويشتغل أوفلاين بس، فالمزامنة المحلية هتموت بصمت.
+                isOnline = { LanGameManager.isLanActive() || SupabaseClientProvider.isConfigured() }
             )
         }
     }

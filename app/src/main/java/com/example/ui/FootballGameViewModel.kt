@@ -7,6 +7,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.StadiumAudioEffects
 import com.example.data.*
+import com.example.data.lan.DiscoveredHost
+import com.example.data.lan.LanGameManager
+import com.example.data.lan.LanProtocol
 import com.example.data.room.CumulativePlayerStat
 import com.example.data.room.GameHighScoreStat
 import com.example.data.room.GameRoom
@@ -81,6 +84,12 @@ sealed class GameScreen {
 
     /** غرفة المباراة المباشرة: مشاركون لحظيون + نتائج الفرق + تحكم المضيف. */
     object RoomMatch : GameScreen()
+
+    /**
+     * ردهة الهوتسبوت/الشبكة المحلية: تشغيل سيرفر، بحث تلقائي عن سيرفرات،
+     * أو اتصال يدوي بعنوان IP.
+     */
+    object HotspotLobby : GameScreen()
 }
 
 class FootballGameViewModel(application: Application) : AndroidViewModel(application) {
@@ -827,6 +836,111 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
     private fun isCurrentPlayer(name: String): Boolean =
         name.trim().equals(repository.userProfile.value.playerName.trim(), ignoreCase = true)
+
+    // =========================================================================
+    // LAN / HOTSPOT MULTIPLAYER — لعب على الشبكة المحلية بدون إنترنت
+    // =========================================================================
+    // الحالة مملوكة لـ LanGameManager (لأنها بتعيش أطول من الـViewModel:
+    // السيرفر لازم يفضل شغّال لو اتلفّت الشاشة)، والـViewModel بيمرّرها
+    // للواجهة وبيغلّف الأوامر — بنفس نمط باقي الـflows في المشروع.
+    // =========================================================================
+
+    init {
+        // المضيف بيتعرّف على نفسه باسم اللاعب الحالي، والقيم بتتقرا لحظياً
+        // عشان لو اللاعب غيّر اسمه بعدين السيرفر يستخدم الاسم الجديد
+        LanGameManager.currentNameProvider = { repository.userProfile.value.playerName }
+        LanGameManager.currentAvatarProvider = { repository.userProfile.value.avatarEmoji }
+    }
+
+    val lanIsHosting: StateFlow<Boolean> = LanGameManager.isHosting
+    val lanHostAddress: StateFlow<String?> = LanGameManager.hostAddress
+    val lanHostPort: StateFlow<Int> = LanGameManager.hostPort
+    val lanDiscoveredHosts: StateFlow<List<DiscoveredHost>> = LanGameManager.discoveredHosts
+    val lanIsDiscovering: StateFlow<Boolean> = LanGameManager.isDiscovering
+    val lanJoinedHost: StateFlow<String?> = LanGameManager.joinedHost
+    val lanIsBusy: StateFlow<Boolean> = LanGameManager.isBusy
+    val lanMessage: StateFlow<String?> = LanGameManager.lanMessage
+    val lanConnectedClientCount: StateFlow<Int> = LanGameManager.connectedClientCount
+
+    /** تشغيل سيرفر اللعبة على الجهاز ده (الهوتسبوت أو الواي فاي المنزلي). */
+    fun startLanHosting(port: Int = LanProtocol.DEFAULT_GAME_PORT) {
+        viewModelScope.launch {
+            audioEffects.playClick()
+            val message = LanGameManager.startHosting(port)
+            if (message.contains("شغّال")) {
+                audioEffects.playWhistle()
+                // نحدّث قائمة الغرف عشان الغرفة المحلية تظهر فوراً
+                loadOnlineRooms()
+            }
+        }
+    }
+
+    /** إيقاف السيرفر المحلي. */
+    fun stopLanHosting() {
+        audioEffects.playClick()
+        LanGameManager.stopHosting()
+        loadOnlineRooms()
+    }
+
+    /** الاتصال بسيرفر مضيف بعنوان IP (الطريقة اليدوية الاحتياطية). */
+    fun connectToLanHost(hostIp: String, port: Int = LanProtocol.DEFAULT_GAME_PORT) {
+        viewModelScope.launch {
+            audioEffects.playClick()
+            val message = LanGameManager.connectToHost(hostIp, port)
+            if (message.startsWith("اتصلت")) {
+                audioEffects.playVictory()
+                loadOnlineRooms()
+            }
+        }
+    }
+
+    /** الاتصال بسيرفر مكتشف تلقائياً. */
+    fun connectToDiscoveredHost(host: DiscoveredHost) {
+        connectToLanHost(host.hostIp, host.port)
+    }
+
+    /** قطع الاتصال بسيرفر مضيف. */
+    fun disconnectFromLanHost() {
+        audioEffects.playClick()
+        LanGameManager.disconnectFromHost()
+        loadOnlineRooms()
+    }
+
+    /** بدء البحث التلقائي عن سيرفرات على نفس الشبكة (بثّ UDP). */
+    fun startLanDiscovery() {
+        LanGameManager.startDiscovery()
+    }
+
+    /** إعادة البحث التلقائي. */
+    fun refreshLanDiscovery() {
+        audioEffects.playClick()
+        LanGameManager.refreshDiscovery()
+    }
+
+    /** إيقاف البحث التلقائي. */
+    fun stopLanDiscovery() {
+        LanGameManager.stopDiscovery()
+    }
+
+    fun dismissLanMessage() {
+        LanGameManager.dismissMessage()
+    }
+
+    /** وصف عربي كامل لحالة الشبكة المحلية — يُعرض في واجهة الهوتسبوت. */
+    fun describeLanStatus(): String = LanGameManager.describeStatus()
+
+    /** عنوان IP لجهاز اللاعب — يُقرأ للأصحاب لو الاكتشاف التلقائي فشل. */
+    fun myLanIpAddress(): String? = LanGameManager.myIpAddress()
+
+    /** هل العنوان ده على نفس شبكة الجهاز؟ (تلميح قبل محاولة الاتصال) */
+    fun isSameSubnetAsDevice(remoteIp: String?): Boolean =
+        LanGameManager.isSameSubnetAsDevice(remoteIp)
+
+    /** تحديث عدد المتصلين بالسيرفر (يستدعى دورياً من الواجهة). */
+    fun refreshLanClientCount() {
+        LanGameManager.updateClientCount()
+    }
+
 
     // =========================================================================
     // ROOM PERSISTENCE: CUMULATIVE PARTY & GATHERING LEADERBOARD
@@ -3048,6 +3162,10 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         bedoonKalamTimerJob?.cancel()
         tabooTimerJob?.cancel()
         roomSessionJob?.cancel()
+
+        // إيقاف سيرفر الهوتسبوت وقفل الـMulticast: onCleared بيُستدعى عند
+        // الخروج من التطبيق مش عند لفّ الشاشة، فالجلسة بتكمل طول ما التطبيق مفتوح
+        LanGameManager.shutdown()
     }
 }
 

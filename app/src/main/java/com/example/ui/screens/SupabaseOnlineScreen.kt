@@ -59,6 +59,13 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     val selectedRoomCode by viewModel.selectedRoomCode.collectAsState()
     val roomParticipants by viewModel.onlineRoomParticipants.collectAsState()
     val isLoadingParticipants by viewModel.isLoadingParticipants.collectAsState()
+
+    // حالة الشبكة المحلية / الهوتسبوت — تُعرض في كارت الهوتسبوت بدل رقم وهمي
+    val lanIsHosting by viewModel.lanIsHosting.collectAsState()
+    val lanJoinedHost by viewModel.lanJoinedHost.collectAsState()
+    val lanHostAddress by viewModel.lanHostAddress.collectAsState()
+    val lanHostPort by viewModel.lanHostPort.collectAsState()
+    val lanConnectedClients by viewModel.lanConnectedClientCount.collectAsState()
     var showCreateRoomDialog by remember { mutableStateOf(false) }
     var showJoinRoomDialog by remember { mutableStateOf(false) }
 
@@ -429,28 +436,62 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                                 )
                                             }
                                         }
+                                        // حالة حقيقية بدل رقم Ping وهمي
+                                        val lanActive = lanIsHosting || lanJoinedHost != null
                                         Box(
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(6.dp))
-                                                .background(EmeraldNeon.copy(alpha = 0.2f))
+                                                .background(
+                                                    if (lanActive) EmeraldNeon.copy(alpha = 0.2f)
+                                                    else PitchDivider
+                                                )
                                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                                         ) {
-                                            Text("Ping: 1ms", color = EmeraldNeon, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                text = when {
+                                                    lanIsHosting -> "سيرفر شغّال 🎮"
+                                                    lanJoinedHost != null -> "متصل ✅"
+                                                    else -> "مش شغّال"
+                                                },
+                                                color = if (lanActive) EmeraldNeon else TextSecondary,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
                                         }
                                     }
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+
+                                    Text(
+                                        text = when {
+                                            lanIsHosting ->
+                                                "عنوان سيرفرك: ${lanHostAddress ?: "----"}:$lanHostPort • متصلون: $lanConnectedClients 👥"
+                                            lanJoinedHost != null -> "متصل بسيرفر: $lanJoinedHost"
+                                            else -> "افتح سيرفر على جهازك، أو دور على سيرفرات أصحابك تلقائياً"
+                                        },
+                                        fontSize = 11.sp,
+                                        color = if (lanIsHosting || lanJoinedHost != null) StadiumCyan else TextSecondary,
+                                        lineHeight = 17.sp
+                                    )
 
                                     Spacer(modifier = Modifier.height(10.dp))
 
                                     Button(
                                         onClick = {
                                             viewModel.audioEffects.playWhistle()
-                                            viewModel.navigateTo(GameScreen.PassAndPlayScreen)
+                                            // ردهة الهوتسبوت الحقيقية: تشغيل سيرفر + بحث تلقائي + IP يدوي
+                                            viewModel.navigateTo(GameScreen.HotspotLobby)
                                         },
                                         modifier = Modifier.fillMaxWidth(),
                                         colors = ButtonDefaults.buttonColors(containerColor = TrophyGold),
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text("تشغيل غرفة الهوتسبوت المحلية 🚀", color = PitchDark, fontWeight = FontWeight.Bold)
+                                        Text(
+                                            text = if (lanIsHosting || lanJoinedHost != null) "إدارة جلسة الشبكة المحلية 📶"
+                                            else "تشغيل غرفة الهوتسبوت المحلية 🚀",
+                                            color = PitchDark,
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     }
                                 }
                             }

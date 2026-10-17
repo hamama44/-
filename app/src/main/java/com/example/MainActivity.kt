@@ -122,6 +122,7 @@ fun MalabAlTahaddiApp(
             is GameScreen.ThirtySecondsRoundsScreen -> ThirtySecondsRoundsScreen(viewModel = viewModel)
             is GameScreen.SupabaseOnlineScreen -> SupabaseOnlineScreen(viewModel = viewModel)
             is GameScreen.RoomMatch -> RoomMatchScreen(viewModel = viewModel)
+            is GameScreen.HotspotLobby -> HotspotScreen(viewModel = viewModel)
         }
     }
 }
