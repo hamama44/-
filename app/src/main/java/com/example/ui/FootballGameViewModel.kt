@@ -27,6 +27,8 @@ import com.example.data.supabase.SupabaseRealtimeClient
 import com.example.data.supabase.SupabaseScore
 import com.example.data.supabase.SupabaseUser
 import com.example.data.supabase.addNewPlayer
+import com.example.data.questions.QuestionFeedLogic
+import com.example.data.questions.QuestionFeedRepository
 import com.example.data.daily.DailyChallenge
 import com.example.data.daily.DailyChallengeManager
 import com.example.data.ai.GeminiSpeechAuditor
@@ -903,6 +905,101 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         name.trim().equals(repository.userProfile.value.playerName.trim(), ignoreCase = true)
 
     // =========================================================================
+    // LIVE QUESTION FEED — أسئلة البوت توصل اللعبة فعلاً
+    // =========================================================================
+    // كل الأسئلة كانت مكتوبة listOf(...) جوه FootballRepository، يعني مقفولة
+    // داخل الـAPK: أي سؤال بيضيفه البوت في Supabase ما كانش بيوصل اللاعب.
+    // الـStateFlows دي بتقرأ الكاش المحلي (Room) مدموجاً مع القائمة المضمّنة،
+    // فاللعبة تاخد الأحدث دايمًا وترجع للمضمّن لو السحابة فاضية أو النت واقع.
+    // =========================================================================
+
+    private val questionFeed = QuestionFeedRepository.get(application)
+
+    private val _questionFeedStatus = MutableStateFlow<QuestionFeedRepository.SyncResult?>(null)
+    val questionFeedStatus: StateFlow<QuestionFeedRepository.SyncResult?> = _questionFeedStatus.asStateFlow()
+
+    val liveThirtySeconds: StateFlow<List<ThirtySecondsQuestion>> =
+        questionFeed.thirtySeconds(repository.getThirtySecondsQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getThirtySecondsQuestions()
+            )
+
+    val liveSabaho: StateFlow<List<SabahoQuestion>> =
+        questionFeed.sabaho(repository.getSabahoQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getSabahoQuestions()
+            )
+
+    val liveTrueFalse: StateFlow<List<TrueFalseQuestion>> =
+        questionFeed.trueFalse(repository.getTrueFalseQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getTrueFalseQuestions()
+            )
+
+    val livePvp: StateFlow<List<PvPQuestion>> =
+        questionFeed.pvp(repository.getPvPQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getPvPQuestions()
+            )
+
+    /** عدد الأسئلة السحابية المخزّنة محلياً — للعرض في الإعدادات. */
+    val cloudQuestionCount: StateFlow<Int> = questionFeed.observeCloudCount()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    /** آخر مرة جابنا فيها من السيرفر — عشان ما نفتحش طلب كل ما اللاعب يفتح لعبة. */
+    private var lastFeedRefreshAtMillis = 0L
+
+    init {
+        // أول مزامنة عند تجهيز الـViewModel (بتغطي فتح التطبيق وتغيير الشبكة)
+        maybeRefreshQuestionFeed()
+    }
+
+    /**
+     * مزامنة لو عدّت [QUESTION_FEED_MIN_REFRESH_MS] على آخر محاولة.
+     * بتتنادى قبل بدء أي لعبة، فمفيش حاجة تانية محتاجها في الخلفية.
+     */
+    fun maybeRefreshQuestionFeed() {
+        val now = System.currentTimeMillis()
+        if (now - lastFeedRefreshAtMillis < QUESTION_FEED_MIN_REFRESH_MS) return
+        lastFeedRefreshAtMillis = now
+        viewModelScope.launch {
+            _questionFeedStatus.value = questionFeed.refresh()
+        }
+    }
+
+    /** مزامنة قسرية من شاشة الإعدادات (زر «حدّث الأسئلة»). */
+    fun forceRefreshQuestionFeed() {
+        lastFeedRefreshAtMillis = System.currentTimeMillis()
+        viewModelScope.launch {
+            audioEffects.playClick()
+            _questionFeedStatus.value = questionFeed.refresh()
+        }
+    }
+
+    fun dismissQuestionFeedStatus() {
+        _questionFeedStatus.value = null
+    }
+
+    /** وصف عربي لحالة الأسئلة — بيشمل عدد أسئلة البوت اللي وصلت فعلاً. */
+    fun questionFeedSummary(): String =
+        QuestionFeedLogic.describeFeed(
+            cloudCount = cloudQuestionCount.value,
+            builtinCount = repository.getThirtySecondsQuestions().size +
+                repository.getSabahoQuestions().size +
+                repository.getTrueFalseQuestions().size +
+                repository.getPvPQuestions().size
+        )
+
+
+    // =========================================================================
     // LAN / HOTSPOT MULTIPLAYER — لعب على الشبكة المحلية بدون إنترنت
     // =========================================================================
     // الحالة مملوكة لـ LanGameManager (لأنها بتعيش أطول من الـViewModel:
@@ -1258,7 +1355,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     private var tsTimerJob: Job? = null
 
     fun startThirtySecondsQuiz() {
-        val questions = repository.getThirtySecondsQuestions().shuffled()
+        // بنقرأ من الـfeed الحي: أسئلة البوت الأول + المضمّن بدون تكرار
+        maybeRefreshQuestionFeed()
+        val questions = liveThirtySeconds.value.shuffled()
         _tsQuestions.value = questions
         _tsCurrentIndex.value = 0
         _tsScore.value = 0
@@ -1446,7 +1545,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     private var sabahoTimerJob: Job? = null
 
     fun startSabahoChallenge() {
-        val questions = repository.getSabahoQuestions().shuffled()
+        maybeRefreshQuestionFeed()
+        val questions = liveSabaho.value.shuffled()
         _sabahoQuestions.value = questions
         _sabahoIndex.value = 0
         _sabahoScore.value = 0
@@ -1708,7 +1808,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     val tfExplanationVisible: StateFlow<Boolean> = _tfExplanationVisible.asStateFlow()
 
     fun startTrueFalseGame() {
-        val list = repository.getTrueFalseQuestions().shuffled()
+        maybeRefreshQuestionFeed()
+        val list = liveTrueFalse.value.shuffled()
         _tfQuestions.value = list
         _tfIndex.value = 0
         _tfStreak.value = 0
@@ -1913,7 +2014,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
         viewModelScope.launch {
             delay(2200) // Simulate finding opponent
-            pvpQuestions = repository.getPvPQuestions().shuffled().take(5)
+            maybeRefreshQuestionFeed()
+            pvpQuestions = livePvp.value.shuffled().take(5)
             if (pvpQuestions.isNotEmpty()) {
                 val q1 = pvpQuestions[0]
                 _pvpState.value = _pvpState.value.copy(
@@ -2176,7 +2278,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
         viewModelScope.launch {
             delay(1800) // Simulated room join
-            pvpQuestions = repository.getPvPQuestions().shuffled().take(5)
+            maybeRefreshQuestionFeed()
+            pvpQuestions = livePvp.value.shuffled().take(5)
             if (pvpQuestions.isNotEmpty()) {
                 val q1 = pvpQuestions[0]
                 _pvpState.value = _pvpState.value.copy(
@@ -3262,6 +3365,15 @@ private const val ROOM_SESSION_IDLE_POLL_MS = 15_000L
  * تحديث مشارك واحد بيسبب عدة أحداث متتالية — بندمجهم في مزامنة واحدة.
  */
 private const val REALTIME_REFRESH_DEBOUNCE_MS = 400L
+
+/**
+ * أقل زمن بين مزامنتين لأسئلة البوت (مللي ثانية).
+ *
+ * عشر دقايق كفاية إن لاعب يفتح أكتر من لعبة ورا بعض من غير ما نرمي طلبات
+ * شبكة زيادة، وفي نفس الوقت لو البوت نشر حالاً اللاعب هيشوف الجديد في
+ * الجلسة الجاية.
+ */
+private const val QUESTION_FEED_MIN_REFRESH_MS = 10 * 60 * 1000L
 
 /** نتائج تجريبية للوحة الصدارة عندما لا يوجد سيرفر مُهيّأ. */
 private fun demoCloudScores(): List<SupabaseScore> = listOf(

@@ -16,3 +16,8 @@
 local.properties
 .env
 debug.keystore
+
+# Python (question bot tooling, runs in CI not in the APK)
+__pycache__/
+*.pyc
+.venv/

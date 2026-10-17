@@ -12,7 +12,14 @@ data class SupabaseQuestion(
     @Json(name = "correct_index") val correctIndex: Int = 0,
     @Json(name = "difficulty") val difficulty: String? = "medium",
     @Json(name = "category") val category: String? = "عامة",
-    @Json(name = "explanation") val explanation: String? = null
+    @Json(name = "explanation") val explanation: String? = null,
+    /**
+     * مصدر السؤال: `seed` | `bot` | `curated` | `admin`.
+     * بيتستخدم للتمييز في الواجهة وللتحليل، و`null` لو الـview مابيعرضوش.
+     */
+    @Json(name = "source") val source: String? = null,
+    /** وقت النشر الفعلي — أساس ترتيب «الأحدث الأول» في كاش التطبيق. */
+    @Json(name = "published_at") val publishedAt: String? = null
 )
 
 @JsonClass(generateAdapter = true)

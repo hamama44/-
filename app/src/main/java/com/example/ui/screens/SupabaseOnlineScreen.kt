@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.example.data.questions.QuestionFeedLogic
 import com.example.data.room.RoomParticipant
 import com.example.data.supabase.*
 import com.example.ui.FootballGameViewModel
@@ -575,6 +576,69 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                             color = PitchDark,
                                             fontWeight = FontWeight.Bold,
                                             fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------
+                        // حالة «الأبداً متحدّث»: كم سؤال وصل من البوت + زر مزامنة يدوي
+                        // ----------------------------------------------------------------
+                        item {
+                            val cloudQuestions by viewModel.cloudQuestionCount.collectAsState()
+                            val feedStatus by viewModel.questionFeedStatus.collectAsState()
+
+                            GlowCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("question_feed_card")
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "🤖 الأسئلة المتجدّدة",
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        )
+                                        Text(
+                                            text = viewModel.questionFeedSummary(),
+                                            fontSize = 11.sp,
+                                            color = StadiumCyan.copy(alpha = 0.85f),
+                                            lineHeight = 16.sp
+                                        )
+                                        feedStatus?.let { result ->
+                                            Text(
+                                                text = result.arabicSummary,
+                                                fontSize = 10.sp,
+                                                color = if (result.failedTypes.isNotEmpty()) {
+                                                    Color(0xFFFFB74D)
+                                                } else {
+                                                    Color.White.copy(alpha = 0.6f)
+                                                },
+                                                modifier = Modifier.padding(top = 4.dp)
+                                            )
+                                        }
+                                        if (QuestionFeedLogic.hasMeaningfulCloudContent(cloudQuestions)) {
+                                            Text(
+                                                text = "أحدث $cloudQuestions سؤال من السيرفر متاح أوفلاين كمان 📴",
+                                                fontSize = 10.sp,
+                                                color = Color.White.copy(alpha = 0.5f),
+                                                modifier = Modifier.padding(top = 2.dp)
+                                            )
+                                        }
+                                    }
+                                    TextButton(onClick = { viewModel.forceRefreshQuestionFeed() }) {
+                                        Text(
+                                            text = "حدّث",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = StadiumCyan
                                         )
                                     }
                                 }

@@ -1,0 +1,126 @@
+name: Question Bot (إضافة أسئلة تلقائياً)
+
+# ===========================================================================
+# بيشتغل إمتى؟
+#   - كل 6 ساعات، أو يدوياً من تبويب Actions (Run workflow) مع تغيير العدد
+#
+# البوت بيولّد أسئلة بـ Gemini، بيدقّقها، بيمنع التكرار، وبينشرها في جدول
+# public/questions. التطبيق بيقرأ من الجدول تلقائياً ⇒ مفيش حاجة تتعمل في
+# المتجر كل مرة، وده المقصود بـ«دايماً متحدّثة».
+#
+# ===========================================================================
+# الإعداد مرة واحدة (GitHub → Settings → Secrets and variables → Actions):
+#   SUPABASE_URL              https://xyzcompany.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY مفتاح service_role — بيسمح بالكتابة وبيتجاوز RLS.
+#                             ⚠️ أقوى مفتاح في المشروع: في Secrets بس،
+#                             مش في الـrepo ومش في الـAPK.
+#   GEMINI_API_KEY            اختياري — من غيره البوت ينشر ملف curated فقط.
+#
+# وبعدين نفّذ supabase_schema_v3.sql مرة واحدة في Supabase SQL Editor.
+# ===========================================================================
+
+on:
+  schedule:
+    # كل 6 ساعات ⇒ 4 تشغيلات في اليوم × الحد اليومي 25 = ~100 سؤال كحد أقصى
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "أقصى عدد أسئلة لكل نوع في التشغيل"
+        required: false
+        default: "6"
+        type: string
+      dry_run:
+        description: "طباعة النتيجة من غير نشر (true/false)"
+        required: false
+        default: "false"
+        type: string
+      source:
+        description: "المصدر: both / gemini / curated"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - gemini
+          - curated
+
+# تشغيل واحد في نفس اللحظة: لو تشغيلين تولّدوا في نفس الوقت، اليونيكون هيمسك
+# التكرار بس ده رمي شبكة بلا فايدة. الأهدأ إننا ما نبدأش أصلاً.
+concurrency:
+  group: question-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  add-questions:
+    name: توليد ونشر الأسئلة
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # السقف اليومي في البوت نفسه، فحتى لو الـcron اتشغّل زيادة مايفخّش الجدول
+      QUESTION_BOT_DAILY_CAP: "25"
+
+    steps:
+      - name: سحب الكود
+        uses: actions/checkout@v4
+
+      - name: تجهيز Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # لو منطق التدقيق مكسور، الأأمن نوقف قبل أي كتابة: البوت النشر التلقائي
+      # معناه إن اللي هيوصل القاعدة هيوصل للاعيبين على طول.
+      - name: اختبار منطق التدقيق
+        run: python3 scripts/question_bot.py --self-test
+
+      - name: فحص الإعدادات
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::ناقص SUPABASE_URL أو SUPABASE_SERVICE_ROLE_KEY في Secrets"
+            exit 1
+          fi
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::warning::GEMINI_API_KEY مش موجود — هيتم نشر ملف curated فقط"
+          fi
+          echo "✅ الإعدادات كاملة"
+
+      - name: تشغيل البوت
+        run: |
+          ARGS="--limit ${{ github.event.inputs.limit || '6' }} --source ${{ github.event.inputs.source || 'both' }}"
+          if [ "${{ github.event.inputs.dry_run || 'false' }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          # الفشل الجزئي (بعض الدفعات اترفضت) مش كارثة، لكن الفشل الكامل
+          # (كود 2: اتصال/إعدادات) لازم يبيّن الـworkflow أحمر عشان ننتبه.
+          set +e
+          python3 scripts/question_bot.py $ARGS
+          CODE=$?
+          set -e
+          echo "BOT_EXIT_CODE=$CODE" >> "$GITHUB_ENV"
+          if [ "$CODE" = "2" ]; then
+            echo "::error::البوت فشل بالكامل (اتصال/إعدادات) — راجع اللوج"
+            exit 2
+          fi
+
+      - name: ملخّص التشغيل
+        if: always()
+        run: |
+          {
+            echo "## 🤖 حالة البوت"
+            echo ""
+            echo "- كود الخروج: \`${BOT_EXIT_CODE:-?}\`"
+            echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
+            if [ -n "$GEMINI_API_KEY" ]; then
+              echo "- التوليد بـ Gemini: مفعّل ✅"
+            else
+              echo "- التوليد بـ Gemini: معطّل (curated فقط) ⚠️"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
