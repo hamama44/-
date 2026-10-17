@@ -21,7 +21,9 @@ import com.example.data.room.RoomParticipant
 import com.example.data.room.RoomTeamScores
 import com.example.data.room.failureMessageOrNull
 import com.example.data.room.getOrNull
+import com.example.data.supabase.RealtimeEvent
 import com.example.data.supabase.SupabaseClientProvider
+import com.example.data.supabase.SupabaseRealtimeClient
 import com.example.data.supabase.SupabaseScore
 import com.example.data.supabase.SupabaseUser
 import com.example.data.supabase.addNewPlayer
@@ -694,8 +696,62 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     private var roomSessionJob: Job? = null
 
     /**
+     * عميل الاشتراك اللحظي (Supabase Realtime / Phoenix WebSocket).
+     *
+     * بيتبني مرة واحدة وبيفضل عائم لحد ما جلسه تبدأ. البناء نفسه رخيص
+     * (مفيش socket لحد [SupabaseRealtimeClient.subscribeToRoom]).
+     */
+    private val realtimeClient = SupabaseRealtimeClient(
+        onEvent = { event -> onRealtimeChange(event) }
+    )
+
+    /** هل الدفع اللحظي شغال؟ (يُعرض في الواجهة بدل رقم Ping وهمي) */
+    val realtimeConnected: StateFlow<Boolean> = realtimeClient.isConnected
+
+    /**
+     * حالة الاشتراك اللحظي — بتمرر من العميل نفسه مباشرةً، لأن العميل
+     * بيحدّثها في كل المسارات (نجاح/رفض/انقطاع) ومفيش سبب إن الـVM يعمل نسخة.
+     */
+    val realtimeStatus: StateFlow<String?> = realtimeClient.statusMessage
+
+    /** تجميع الانفجارات: عدة تغييرات في نفس اللحظة = تحديث واحد. */
+    private var realtimeRefreshJob: Job? = null
+
+    private fun onRealtimeChange(event: RealtimeEvent) {
+        if (!event.isRoomChange) return
+        realtimeRefreshJob?.cancel()
+        realtimeRefreshJob = viewModelScope.launch {
+            delay(REALTIME_REFRESH_DEBOUNCE_MS)
+            syncRoomSessionOnce()
+        }
+    }
+
+    /**
+     * الاشتراك اللحظي بيُفعّل على السحابة بس: في وضع الهوتسبوت مفيش
+     * Supabase من الأساس، والدفع بيتم من الـkeep-alive بتاع السيرفر المحلي.
+     */
+    private fun startRealtimeSubscription(roomCode: String) {
+        if (!SupabaseClientProvider.isConfigured() || LanGameManager.isLanActive()) {
+            // مفيش سحابة نتشترك معاها: نمسح أي رسالة قديمة وسِب الحلبة
+            // الدورية تشتغل، بدل ما اللاعب يقرا «اتصال لحظي شغّال» كاذبة
+            realtimeClient.clearStatus()
+            return
+        }
+        // العميل نفسه بيحط رسالة عربية في كل مسار فشل، فمفيش حاجة تانية نقولها هنا
+        realtimeClient.subscribeToRoom(roomCode)
+    }
+
+    private fun stopRealtimeSubscription() {
+        realtimeRefreshJob?.cancel()
+        realtimeRefreshJob = null
+        realtimeClient.unsubscribe()
+        realtimeClient.clearStatus()
+    }
+
+    /**
      * دخول غرفة وبدء جلسة متزامنة: يفتح شاشة المباراة ويشغّل حلقة تحديث
-     * تجيب حالة الغرفة والمشاركين كل [ROOM_SESSION_POLL_MS] مللي ثانية.
+     * تجيب حالة الغرفة والمشاركين كل [ROOM_SESSION_POLL_MS] مللي ثانية،
+     * كطريق احتياطي لو الاشتراك اللحظي ماشتغلش.
      */
     fun enterRoom(room: GameRoom) {
         audioEffects.playWhistle()
@@ -704,6 +760,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         _isRoomSessionHost.value = isCurrentPlayer(room.hostName)
         navigateTo(GameScreen.RoomMatch)
         startRoomSessionLoop()
+        startRealtimeSubscription(room.roomCode)
     }
 
     /** دخول بالكود مباشرةً (بعد joinRoom) بدون الحاجة لكائن الغرفة في الشاشة. */
@@ -718,10 +775,11 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    /** الخروج من الغرفة وإيقاف حلقة التحديث (لا يحذف الغرفة من السيرفر). */
+    /** الخروج من الغرفة وإيقاف حلقة التحديث والاشتراك اللحظي (الغرفة نفسها ما تتحذفش). */
     fun leaveRoom() {
         roomSessionJob?.cancel()
         roomSessionJob = null
+        stopRealtimeSubscription()
         _activeRoomCode.value = null
         _activeRoom.value = null
         _activeRoomParticipants.value = emptyList()
@@ -743,7 +801,14 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
             // أول تحديث فوري حتى لا تشاهد الشاشة حالة قديمة
             syncRoomSessionOnce()
             while (isActive) {
-                delay(ROOM_SESSION_POLL_MS)
+                // لو الدفع اللحظي شغال فالحلقة مجرد شبكة أمان ⇒ تبطّئ،
+                // وإلا هي مصدر التحديث الوحيد ⇒ تسريع
+                val waitMs = if (realtimeClient.isConnected.value) {
+                    ROOM_SESSION_IDLE_POLL_MS
+                } else {
+                    ROOM_SESSION_POLL_MS
+                }
+                delay(waitMs)
                 syncRoomSessionOnce()
             }
         }
@@ -3162,6 +3227,11 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         bedoonKalamTimerJob?.cancel()
         tabooTimerJob?.cancel()
         roomSessionJob?.cancel()
+        realtimeRefreshJob?.cancel()
+
+        // إغلاق اتصال Realtime صراحةً: سيب WebSocket مفتوح بعد موت الـViewModel
+        // معناه خيط ونبضات شغالة لأبد الآبد واستنزاف بطارية بلا أي مستمع
+        realtimeClient.dispose()
 
         // إيقاف سيرفر الهوتسبوت وقفل الـMulticast: onCleared بيُستدعى عند
         // الخروج من التطبيق مش عند لفّ الشاشة، فالجلسة بتكمل طول ما التطبيق مفتوح
@@ -3176,10 +3246,22 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 private const val CLOUD_LEADERBOARD_LIMIT = 25
 
 /**
- * فترة تحديث جلسة المباراة المباشرة (مللي ثانية).
+ * فترة تحديث جلسة المباراة المباشرة (مللي ثانية) عندما لا يوجد دفع لحظي.
  * 3 ثواني توازن بين الإحساس باللحظية واستهلاك الشبكة/البطارية.
  */
 private const val ROOM_SESSION_POLL_MS = 3_000L
+
+/**
+ * فترة التحديث عندما يكون الاشتراك اللحظي (Realtime) شغالاً: الحلبة هنا
+ * شبكة أمان فقط، فنبطّئها لتوفير البطارية والبيانات.
+ */
+private const val ROOM_SESSION_IDLE_POLL_MS = 15_000L
+
+/**
+ * تجميع انفجارات أحداث Realtime (مللي ثانية).
+ * تحديث مشارك واحد بيسبب عدة أحداث متتالية — بندمجهم في مزامنة واحدة.
+ */
+private const val REALTIME_REFRESH_DEBOUNCE_MS = 400L
 
 /** نتائج تجريبية للوحة الصدارة عندما لا يوجد سيرفر مُهيّأ. */
 private fun demoCloudScores(): List<SupabaseScore> = listOf(

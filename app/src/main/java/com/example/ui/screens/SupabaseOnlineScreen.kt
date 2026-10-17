@@ -66,6 +66,9 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     val lanHostAddress by viewModel.lanHostAddress.collectAsState()
     val lanHostPort by viewModel.lanHostPort.collectAsState()
     val lanConnectedClients by viewModel.lanConnectedClientCount.collectAsState()
+
+    // حالة الدفع اللحظي (WebSocket) — بتتحدد في وصف الاتصال بدل نص ثابت مبالغ فيه
+    val realtimeConnected by viewModel.realtimeConnected.collectAsState()
     var showCreateRoomDialog by remember { mutableStateOf(false) }
     var showJoinRoomDialog by remember { mutableStateOf(false) }
 
@@ -156,10 +159,19 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White
                             )
+                            // وصف صادق يعكس النقل الشغال فعلاً، مش ادّعاء ثابت
+                            val lanActive = lanIsHosting || lanJoinedHost != null
                             Text(
-                                text = if (isConfigured) "قاعدة بيانات PostgreSQL + غرف WebSockets جاهزة" else "اضغط هنا لإدخال بيانات مشروع Supabase الخاص بك",
+                                text = when {
+                                    lanActive -> "جلسة شبكة محلية نشطة 📶 — لعب بدون إنترنت"
+                                    isConfigured && realtimeConnected ->
+                                        "قاعدة بيانات PostgreSQL + تحديث لحظي عبر WebSocket ⚡"
+                                    isConfigured ->
+                                        "قاعدة بيانات PostgreSQL + تحديث دوري كل 3 ثواني ⏳"
+                                    else -> "اضغط هنا لإدخال بيانات مشروع Supabase الخاص بك"
+                                },
                                 fontSize = 10.sp,
-                                color = TextSecondary
+                                color = if (isConfigured && realtimeConnected) EmeraldNeon else TextSecondary
                             )
                         }
                     }
