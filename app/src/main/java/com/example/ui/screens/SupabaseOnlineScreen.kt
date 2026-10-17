@@ -36,15 +36,16 @@ import com.example.ui.components.EmeraldButton
 import com.example.ui.components.GlowCard
 import com.example.ui.components.StadiumTopBar
 import com.example.ui.theme.*
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+
+/** فترة تحديث قائمة المشاركين تلقائياً طالما الحوار مفتوح. */
+private const val PARTICIPANTS_REFRESH_INTERVAL_MS = 5_000L
 
 @Composable
 fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     val context = LocalContext.current
     val userProfile by viewModel.userProfile.collectAsState()
-    val scope = rememberCoroutineScope()
 
-    val supabaseClient = remember { SupabaseClient() }
     var selectedTab by remember { mutableIntStateOf(0) } // 0: غرف اللعب, 1: السيرفرات الإقليمية, 2: المتصدرين سحابياً
 
     var isConfigured by remember { mutableStateOf(SupabaseConfig.isConfigured) }
@@ -61,9 +62,10 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     var showCreateRoomDialog by remember { mutableStateOf(false) }
     var showJoinRoomDialog by remember { mutableStateOf(false) }
 
-    // Leaderboard state
-    var cloudScores by remember { mutableStateOf<List<SupabaseScore>>(emptyList()) }
-    var isLoadingScores by remember { mutableStateOf(false) }
+    // Leaderboard state — عبر SupabaseUserDao (views: leaderboard + users)
+    val cloudScores by viewModel.cloudLeaderboard.collectAsState()
+    val isLoadingScores by viewModel.isCloudLeaderboardLoading.collectAsState()
+    val cloudUserProfile by viewModel.cloudUserProfile.collectAsState()
 
     fun refreshRooms() {
         // المستودع يجلب من Supabase ويحدّث الكاش؛ والقائمة تُراقَب عبر Flow في الـ ViewModel
@@ -71,16 +73,7 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     }
 
     fun refreshScores() {
-        scope.launch {
-            isLoadingScores = true
-            val scores = supabaseClient.fetchLeaderboard()
-            cloudScores = if (scores.isNotEmpty()) scores else listOf(
-                SupabaseScore(id = "1", playerName = "عمر المدريدي 👑", points = 5420, coins = 1100, levelTitle = "أسطورة الملاعب", favoriteClub = "ريال مدريد"),
-                SupabaseScore(id = "2", playerName = "ياسين الأطلسي 🇲🇦", points = 4950, coins = 980, levelTitle = "محترف دولي", favoriteClub = "الوداد البيضاوي"),
-                SupabaseScore(id = "3", playerName = "أحمد الفراعنة 🇪🇬", points = 4310, coins = 820, levelTitle = "كابتن الملعب", favoriteClub = "الأهلي المصري")
-            )
-            isLoadingScores = false
-        }
+        viewModel.loadCloudLeaderboard()
     }
 
     LaunchedEffect(Unit) {
@@ -97,6 +90,15 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
         roomActionMessage?.let { message ->
             Toast.makeText(context, message, Toast.LENGTH_LONG).show()
             viewModel.dismissRoomActionMessage()
+        }
+    }
+
+    // تحديث قائمة المشاركين دورياً طالما الحوار مفتوح (يشبه سلوك Realtime)
+    LaunchedEffect(selectedRoomCode) {
+        if (selectedRoomCode == null) return@LaunchedEffect
+        while (true) {
+            delay(PARTICIPANTS_REFRESH_INTERVAL_MS)
+            viewModel.refreshRoomParticipants()
         }
     }
 
@@ -470,6 +472,94 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                             .weight(1f),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // ---- ملفك العالمي من view `public.users` ----
+                        item {
+                            GlowCard(
+                                modifier = Modifier.fillMaxWidth(),
+                                borderColor = StadiumCyan
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Text(
+                                        text = "ملفك العالمي 🌍",
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        fontSize = 13.sp
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
+
+                                    val cloudUser = cloudUserProfile
+                                    if (cloudUser != null) {
+                                        Text(
+                                            text = "${cloudUser.displayName} • ${cloudUser.levelTitle ?: "مشجع"}",
+                                            color = TrophyGold,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "إجمالي النقاط: ${cloudUser.totalPoints} 🏆  •  العملات: ${cloudUser.totalCoins} 🪙",
+                                            color = Color.White,
+                                            fontSize = 11.sp
+                                        )
+                                        Text(
+                                            text = "التحديات المسجّلة: ${cloudUser.challengesPlayed} ⚽  •  أفضل نتيجة: ${cloudUser.bestChallengePoints}",
+                                            color = TextSecondary,
+                                            fontSize = 11.sp
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "لسه ما اتسجلتش في الجدول السحابي — سجّل اسمك دلوقتي وابدأ تحدياتك 🚀",
+                                            color = TextSecondary,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(10.dp))
+
+                                    Button(
+                                        onClick = { viewModel.registerPlayerInCloud() },
+                                        enabled = !isLoadingScores,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text(
+                                            text = if (isLoadingScores) "جارٍ الحفظ..." else "أضفني لاعباً جديداً في الجدول ➕",
+                                            color = PitchDark,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "أعلى النتائج من جدول leaderboard (${cloudScores.size})",
+                                    fontSize = 12.sp,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (isLoadingScores) {
+                                    CircularProgressIndicator(
+                                        color = StadiumCyan,
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    IconButton(onClick = { refreshScores() }, modifier = Modifier.size(30.dp)) {
+                                        Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = StadiumCyan)
+                                    }
+                                }
+                            }
+                        }
+
                         items(cloudScores) { score ->
                             Card(
                                 modifier = Modifier

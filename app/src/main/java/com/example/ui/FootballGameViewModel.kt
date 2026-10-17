@@ -17,6 +17,10 @@ import com.example.data.room.PartyLeaderboardRecordEntity
 import com.example.data.room.RoomParticipant
 import com.example.data.room.failureMessageOrNull
 import com.example.data.room.getOrNull
+import com.example.data.supabase.SupabaseClientProvider
+import com.example.data.supabase.SupabaseScore
+import com.example.data.supabase.SupabaseUser
+import com.example.data.supabase.addNewPlayer
 import com.example.data.daily.DailyChallenge
 import com.example.data.daily.DailyChallengeManager
 import com.example.data.ai.GeminiSpeechAuditor
@@ -578,6 +582,71 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
             if (synced > 0) {
                 audioEffects.playCorrect()
                 _roomActionMessage.value = "تمت مزامنة $synced غرفة مع السيرفر ☁️"
+            }
+        }
+    }
+
+    // =========================================================================
+    // CLOUD USERS & LEADERBOARD: جداول users و leaderboard في Supabase
+    // =========================================================================
+    /** أعلى النتائج من view `public.leaderboard`. */
+    private val _cloudLeaderboard = MutableStateFlow<List<SupabaseScore>>(emptyList())
+    val cloudLeaderboard: StateFlow<List<SupabaseScore>> = _cloudLeaderboard.asStateFlow()
+
+    /** ملف اللاعب الحالي من view `public.users` (إجمالي نقاطه وتحدياته). */
+    private val _cloudUserProfile = MutableStateFlow<SupabaseUser?>(null)
+    val cloudUserProfile: StateFlow<SupabaseUser?> = _cloudUserProfile.asStateFlow()
+
+    private val _isCloudLeaderboardLoading = MutableStateFlow(false)
+    val isCloudLeaderboardLoading: StateFlow<Boolean> = _isCloudLeaderboardLoading.asStateFlow()
+
+    /** سحب لوحة الصدارة وملف اللاعب من Supabase. */
+    fun loadCloudLeaderboard() {
+        viewModelScope.launch { loadCloudLeaderboardData() }
+    }
+
+    private suspend fun loadCloudLeaderboardData() {
+        _isCloudLeaderboardLoading.value = true
+        val userDao = SupabaseClientProvider.userDao()
+
+        val scores = runCatching { userDao.fetchLeaderboard(CLOUD_LEADERBOARD_LIMIT) }.getOrNull()
+        _cloudLeaderboard.value = if (!scores.isNullOrEmpty()) scores else demoCloudScores()
+
+        val profileName = repository.userProfile.value.playerName
+        _cloudUserProfile.value = runCatching { userDao.fetchUserByName(profileName) }.getOrNull()
+
+        _isCloudLeaderboardLoading.value = false
+    }
+
+    /**
+     * تسجيل اللاعب الحالي في الجدول السحابي عبر الدالة البسيطة [addNewPlayer]
+     * (إدراج في `leaderboard` ⇒ يظهر تلقائياً في `users`).
+     */
+    fun registerPlayerInCloud() {
+        viewModelScope.launch {
+            _isCloudLeaderboardLoading.value = true
+            val profile = repository.userProfile.value
+
+            val registered = runCatching {
+                addNewPlayer(
+                    playerName = profile.playerName,
+                    points = profile.points,
+                    coins = profile.coins,
+                    levelTitle = profile.levelTitle,
+                    favoriteClub = profile.favoriteClub,
+                    challengeType = "general"
+                )
+            }.getOrDefault(false)
+
+            _isCloudLeaderboardLoading.value = false
+
+            if (registered) {
+                audioEffects.playVictory()
+                _roomActionMessage.value = "تم تسجيلك في لوحة الصدارة العالمية 🌍🏆"
+                loadCloudLeaderboardData()
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = "تعذّر التسجيل — تأكد من إعدادات Supabase 🔌"
             }
         }
     }
@@ -2804,6 +2873,16 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 // -----------------------------------------------------------------------------
 // PRIVATE HELPER FUNCTIONS
 // -----------------------------------------------------------------------------
+/** عدد الصفوف المسحوبة من لوحة الصدارة السحابية. */
+private const val CLOUD_LEADERBOARD_LIMIT = 25
+
+/** نتائج تجريبية للوحة الصدارة عندما لا يوجد سيرفر مُهيّأ. */
+private fun demoCloudScores(): List<SupabaseScore> = listOf(
+    SupabaseScore(id = "demo_1", playerName = "عمر المدريدي 👑", points = 5420, coins = 1100, levelTitle = "أسطورة الملاعب", favoriteClub = "ريال مدريد"),
+    SupabaseScore(id = "demo_2", playerName = "ياسين الأطلسي 🇲🇦", points = 4950, coins = 980, levelTitle = "محترف دولي", favoriteClub = "الوداد البيضاوي"),
+    SupabaseScore(id = "demo_3", playerName = "أحمد الفراعنة 🇪🇬", points = 4310, coins = 820, levelTitle = "كابتن الملعب", favoriteClub = "الأهلي المصري")
+)
+
 /**
  * غرف تجريبية تُعرض عندما لا توجد غرف حقيقية (سيرفر غير مُهيّأ أو قائمة فارغة)،
  * حتى تبقى شاشة "غرف اللعب" حيّة وقابلة للتجربة.

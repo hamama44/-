@@ -78,13 +78,13 @@ class SupabaseUserDao(private val api: SupabaseApi) {
      * @return `true` عند نجاح الإدراج في السيرفر.
      */
     suspend fun addPlayer(draft: NewPlayerDraft): Boolean {
-        val name = draft.playerName.trim()
+        val name = sanitizePlayerName(draft.playerName)
         if (name.isEmpty()) return false
 
         val entry = SupabaseScore(
             // id = null → تحذفه Moshi من الـ JSON فتولّد القاعدة UUID تلقائياً
             id = null,
-            playerName = name.take(MAX_NAME_LENGTH),
+            playerName = name,
             points = draft.points.coerceAtLeast(0),
             coins = draft.coins.coerceAtLeast(0),
             levelTitle = draft.levelTitle,
@@ -125,6 +125,24 @@ data class NewPlayerDraft(
     val favoriteClub: String = SupabaseUserDao.DEFAULT_FAVORITE_CLUB,
     val challengeType: String = SupabaseUserDao.DEFAULT_CHALLENGE_TYPE
 )
+
+/**
+ * تنظيف اسم اللاعب قبل إدراجه في الجدول: قصّ المسافات، توحيد المسافات الداخلية
+ * (بما فيها فواصل الأسطر) إلى مسافة واحدة، وتقييد الطول بحد العمود.
+ *
+ * دالة نقية حتى تُختبر بدون شبكة أو Context.
+ *
+ * @return الاسم الصالح للإدراج، أو نص فارغ إذا كان المدخل غير صالح.
+ */
+fun sanitizePlayerName(
+    raw: String,
+    maxLength: Int = SupabaseUserDao.MAX_NAME_LENGTH
+): String = raw.trim()
+    .replace(WHITESPACE_RUN_REGEX, " ")
+    .take(maxLength.coerceAtLeast(0))
+    .trim()
+
+private val WHITESPACE_RUN_REGEX = Regex("\\s+")
 
 /**
  * **الدالة البسيطة المطلوبة لإضافة لاعب جديد إلى الجدول.**
