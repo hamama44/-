@@ -1,5 +1,7 @@
 package com.example.data.room
 
+import kotlin.math.abs
+
 /**
  * نماذج الـ Domain الخاصة بالغرف الأونلاين + عقد مصدر البيانات البعيد.
  *
@@ -111,6 +113,71 @@ data class RoomParticipant(
         /** أي قيمة غير BLUE تُعتبر RED. */
         fun normalizeTeamColor(raw: String): String =
             if (raw.trim().equals(TEAM_BLUE, ignoreCase = true)) TEAM_BLUE else TEAM_RED
+    }
+}
+
+/**
+ * حصيلة نتائج الفرق داخل غرفة لحظياً — تُحسب من قائمة المشاركين.
+ *
+ * نموذج نقي (بدون Android ولا شبكة) لأن منطق احتساب الفائز لازم يكون
+ * قابلاً للاختبار مباشرةً، ولأن نفس الدالة تُستخدم في وضع الأونلاين
+ * ووضع الهوتسبوت المحلي.
+ */
+data class RoomTeamScores(
+    val redScore: Int = 0,
+    val blueScore: Int = 0,
+    val redCount: Int = 0,
+    val blueCount: Int = 0,
+    val readyCount: Int = 0,
+    val totalCount: Int = 0
+) {
+    /** هل كل المشاركين جاهزون؟ (المضيف جاهز تلقائياً عند إنشاء الغرفة) */
+    val allReady: Boolean get() = totalCount > 0 && readyCount >= totalCount
+
+    val isTie: Boolean get() = redScore == blueScore
+
+    val scoreGap: Int get() = abs(redScore - blueScore)
+
+    /** لون الفريق المتقدم، أو `null` عند التعادل. */
+    val leaderTeamColor: String?
+        get() = when {
+            redScore > blueScore -> RoomParticipant.TEAM_RED
+            blueScore > redScore -> RoomParticipant.TEAM_BLUE
+            else -> null
+        }
+
+    val arabicLeaderLabel: String
+        get() = when (leaderTeamColor) {
+            RoomParticipant.TEAM_RED -> "الفريق الأحمر متقدم 🔴"
+            RoomParticipant.TEAM_BLUE -> "الفريق الأزرق متقدم 🔵"
+            else -> "تعادل حتى الآن 🤝"
+        }
+
+    /** نسبة تقدم الفريق الأحمر لعرض شريط النتائج في الواجهة (0f - 1f). */
+    val redProgressRatio: Float
+        get() {
+            val total = redScore + blueScore
+            return if (total <= 0) 0.5f else redScore.toFloat() / total.toFloat()
+        }
+
+    val isEmpty: Boolean get() = totalCount == 0
+
+    companion object {
+        val EMPTY = RoomTeamScores()
+
+        /** احتساب الحصيلة من قائمة المشاركين (أي مشارك لونه غير BLUE يُحسب أحمر). */
+        fun from(participants: List<RoomParticipant>): RoomTeamScores {
+            val red = participants.filter { it.isTeamRed }
+            val blue = participants.filterNot { it.isTeamRed }
+            return RoomTeamScores(
+                redScore = red.sumOf { it.score.coerceAtLeast(0) },
+                blueScore = blue.sumOf { it.score.coerceAtLeast(0) },
+                redCount = red.size,
+                blueCount = blue.size,
+                readyCount = participants.count { it.isReady },
+                totalCount = participants.size
+            )
+        }
     }
 }
 

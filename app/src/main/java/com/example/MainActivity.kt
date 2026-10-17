@@ -121,6 +121,7 @@ fun MalabAlTahaddiApp(
             is GameScreen.TruthOrDareScreen -> TruthOrDareScreen(viewModel = viewModel)
             is GameScreen.ThirtySecondsRoundsScreen -> ThirtySecondsRoundsScreen(viewModel = viewModel)
             is GameScreen.SupabaseOnlineScreen -> SupabaseOnlineScreen(viewModel = viewModel)
+            is GameScreen.RoomMatch -> RoomMatchScreen(viewModel = viewModel)
         }
     }
 }

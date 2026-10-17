@@ -325,15 +325,9 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                         Button(
                                             onClick = {
-                                                viewModel.audioEffects.playWhistle()
-                                                // Launch corresponding game for PvP match
-                                                when (room.gameType) {
-                                                    "thirty_seconds" -> viewModel.startThirtySecondsQuiz()
-                                                    "buzzer" -> viewModel.navigateTo(GameScreen.ThirtySecondsRoundsScreen)
-                                                    "tictactoe" -> viewModel.navigateTo(GameScreen.FootballTicTacToeScreen)
-                                                    "auction" -> viewModel.navigateTo(GameScreen.FootballAuctionScreen)
-                                                    else -> viewModel.startPvPMatchSearch()
-                                                }
+                                                // دخول الغرفة = جلسة متزامنة: المشاركين
+                                                // ونتائج الفرق والجولات تتحدث بين الأجهزة
+                                                viewModel.enterRoom(room)
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
                                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
@@ -756,9 +750,10 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         onClick = {
                             if (inputRoomCode.isNotBlank()) {
                                 showJoinRoomDialog = false
-                                // فحص السعة والتكرار + موازنة الفرق تلقائياً داخل المستودع
+                                // فحص السعة والتكرار + موازنة الفرق تلقائياً داخل المستودع،
+                                // وبعد النجاح ندخل جلسة المباراة المتزامنة مباشرةً
                                 viewModel.joinOnlineRoom(inputRoomCode) {
-                                    viewModel.startPvPMatchSearch()
+                                    viewModel.enterRoomByCode(inputRoomCode)
                                 }
                             }
                         },
