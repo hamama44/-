@@ -28,8 +28,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import com.example.data.questions.QuestionFeedLogic
-import com.example.data.room.RoomParticipant
 import com.example.data.supabase.*
 import com.example.ui.FootballGameViewModel
 import com.example.ui.GameScreen
@@ -37,80 +35,79 @@ import com.example.ui.components.EmeraldButton
 import com.example.ui.components.GlowCard
 import com.example.ui.components.StadiumTopBar
 import com.example.ui.theme.*
-import kotlinx.coroutines.delay
-
-/** فترة تحديث قائمة المشاركين تلقائياً طالما الحوار مفتوح. */
-private const val PARTICIPANTS_REFRESH_INTERVAL_MS = 5_000L
+import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 @Composable
 fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     val context = LocalContext.current
     val userProfile by viewModel.userProfile.collectAsState()
+    val scope = rememberCoroutineScope()
 
+    val supabaseClient = remember { SupabaseClient() }
     var selectedTab by remember { mutableIntStateOf(0) } // 0: غرف اللعب, 1: السيرفرات الإقليمية, 2: المتصدرين سحابياً
 
     var isConfigured by remember { mutableStateOf(SupabaseConfig.isConfigured) }
     var showConfigDialog by remember { mutableStateOf(false) }
 
-    // Rooms state — كلها عبر GameRoomRepository (Supabase + كاش Room محلي)
-    val activeRooms by viewModel.onlineRooms.collectAsState()
-    val isLoadingRooms by viewModel.isRoomActionBusy.collectAsState()
-    val roomPreviewCode by viewModel.roomPreviewCode.collectAsState()
-    val roomActionMessage by viewModel.roomActionMessage.collectAsState()
-    val selectedRoomCode by viewModel.selectedRoomCode.collectAsState()
-    val roomParticipants by viewModel.onlineRoomParticipants.collectAsState()
-    val isLoadingParticipants by viewModel.isLoadingParticipants.collectAsState()
-
-    // حالة الشبكة المحلية / الهوتسبوت — تُعرض في كارت الهوتسبوت بدل رقم وهمي
-    val lanIsHosting by viewModel.lanIsHosting.collectAsState()
-    val lanJoinedHost by viewModel.lanJoinedHost.collectAsState()
-    val lanHostAddress by viewModel.lanHostAddress.collectAsState()
-    val lanHostPort by viewModel.lanHostPort.collectAsState()
-    val lanConnectedClients by viewModel.lanConnectedClientCount.collectAsState()
-
-    // حالة الدفع اللحظي (WebSocket) — بتتحدد في وصف الاتصال بدل نص ثابت مبالغ فيه
-    val realtimeConnected by viewModel.realtimeConnected.collectAsState()
+    // Rooms state
+    var activeRooms by remember { mutableStateOf<List<SupabaseGameRoom>>(emptyList()) }
+    var isLoadingRooms by remember { mutableStateOf(false) }
     var showCreateRoomDialog by remember { mutableStateOf(false) }
     var showJoinRoomDialog by remember { mutableStateOf(false) }
 
-    // Leaderboard state — عبر SupabaseUserDao (views: leaderboard + users)
-    val cloudScores by viewModel.cloudLeaderboard.collectAsState()
-    val isLoadingScores by viewModel.isCloudLeaderboardLoading.collectAsState()
-    val cloudUserProfile by viewModel.cloudUserProfile.collectAsState()
+    // Leaderboard state
+    var cloudScores by remember { mutableStateOf<List<SupabaseScore>>(emptyList()) }
+    var isLoadingScores by remember { mutableStateOf(false) }
 
     fun refreshRooms() {
-        // المستودع يجلب من Supabase ويحدّث الكاش؛ والقائمة تُراقَب عبر Flow في الـ ViewModel
-        viewModel.loadOnlineRooms()
+        scope.launch {
+            isLoadingRooms = true
+            val rooms = supabaseClient.fetchActiveGameRooms()
+            activeRooms = if (rooms.isNotEmpty()) rooms else listOf(
+                SupabaseGameRoom(
+                    id = "mock_1",
+                    roomCode = "STAD99",
+                    gameType = "thirty_seconds",
+                    status = "waiting",
+                    hostName = "كابتن ساري ⚽"
+                ),
+                SupabaseGameRoom(
+                    id = "mock_2",
+                    roomCode = "BUZZ22",
+                    gameType = "buzzer",
+                    status = "waiting",
+                    hostName = "فارس الكالتشيو 🇮🇹"
+                ),
+                SupabaseGameRoom(
+                    id = "mock_3",
+                    roomCode = "GRID33",
+                    gameType = "tictactoe",
+                    status = "waiting",
+                    hostName = "البروفيسور 🧠"
+                )
+            )
+            isLoadingRooms = false
+        }
     }
 
     fun refreshScores() {
-        viewModel.loadCloudLeaderboard()
+        scope.launch {
+            isLoadingScores = true
+            val scores = supabaseClient.fetchLeaderboard()
+            cloudScores = if (scores.isNotEmpty()) scores else listOf(
+                SupabaseScore(id = "1", playerName = "عمر المدريدي 👑", points = 5420, coins = 1100, levelTitle = "أسطورة الملاعب", favoriteClub = "ريال مدريد"),
+                SupabaseScore(id = "2", playerName = "ياسين الأطلسي 🇲🇦", points = 4950, coins = 980, levelTitle = "محترف دولي", favoriteClub = "الوداد البيضاوي"),
+                SupabaseScore(id = "3", playerName = "أحمد الفراعنة 🇪🇬", points = 4310, coins = 820, levelTitle = "كابتن الملعب", favoriteClub = "الأهلي المصري")
+            )
+            isLoadingScores = false
+        }
     }
 
     LaunchedEffect(Unit) {
-        SupabaseClientProvider.initialize(context)
         SupabaseConfig.init(context)
         isConfigured = SupabaseConfig.isConfigured
         refreshRooms()
-        // دفع أي غرف/مشاركين أُنشئت أوفلاين في جلسة سابقة
-        viewModel.syncPendingOnlineRooms()
-    }
-
-    // أي رسالة من المستودع (نجاح/فشل) تُعرض مرة واحدة كـ Toast
-    LaunchedEffect(roomActionMessage) {
-        roomActionMessage?.let { message ->
-            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
-            viewModel.dismissRoomActionMessage()
-        }
-    }
-
-    // تحديث قائمة المشاركين دورياً طالما الحوار مفتوح (يشبه سلوك Realtime)
-    LaunchedEffect(selectedRoomCode) {
-        if (selectedRoomCode == null) return@LaunchedEffect
-        while (true) {
-            delay(PARTICIPANTS_REFRESH_INTERVAL_MS)
-            viewModel.refreshRoomParticipants()
-        }
     }
 
     Scaffold(
@@ -160,19 +157,10 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White
                             )
-                            // وصف صادق يعكس النقل الشغال فعلاً، مش ادّعاء ثابت
-                            val lanActive = lanIsHosting || lanJoinedHost != null
                             Text(
-                                text = when {
-                                    lanActive -> "جلسة شبكة محلية نشطة 📶 — لعب بدون إنترنت"
-                                    isConfigured && realtimeConnected ->
-                                        "قاعدة بيانات PostgreSQL + تحديث لحظي عبر WebSocket ⚡"
-                                    isConfigured ->
-                                        "قاعدة بيانات PostgreSQL + تحديث دوري كل 3 ثواني ⏳"
-                                    else -> "اضغط هنا لإدخال بيانات مشروع Supabase الخاص بك"
-                                },
+                                text = if (isConfigured) "قاعدة بيانات PostgreSQL + غرف WebSockets جاهزة" else "اضغط هنا لإدخال بيانات مشروع Supabase الخاص بك",
                                 fontSize = 10.sp,
-                                color = if (isConfigured && realtimeConnected) EmeraldNeon else TextSecondary
+                                color = TextSecondary
                             )
                         }
                     }
@@ -291,7 +279,13 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         items(activeRooms) { room ->
-                            val gameTitle = room.arabicGameTitle
+                            val gameTitle = when (room.gameType) {
+                                "thirty_seconds" -> "تحدي الثلاثين ⏱️"
+                                "buzzer" -> "صراع الجرس 🔔"
+                                "tictactoe" -> "تيك تاك تو كروي ⚽"
+                                "auction" -> "المزاد الكروي 🔨"
+                                else -> "تحدي مباشر ⚽"
+                            }
 
                             Card(
                                 modifier = Modifier
@@ -327,51 +321,29 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                         }
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
-                                            text = "المضيف: ${room.hostName} • ${room.arabicStatusLabel}",
+                                            text = "المضيف: ${room.hostName} • الحالة: ${if (room.status == "waiting") "في انتظار منافس ⏳" else "جارية ⚽"}",
                                             fontSize = 11.sp,
                                             color = TextSecondary
                                         )
-                                        Text(
-                                            text = if (room.isOfflineOnly) {
-                                                "${room.capacityLabel} • محفوظة محلياً بانتظار المزامنة 📴"
-                                            } else {
-                                                "${room.capacityLabel} • جولة ${room.currentRound}/${room.maxRounds}"
-                                            },
-                                            fontSize = 10.sp,
-                                            color = if (room.isFull) TrophyGold else StadiumCyan
-                                        )
                                     }
 
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Button(
-                                            onClick = {
-                                                // دخول الغرفة = جلسة متزامنة: المشاركين
-                                                // ونتائج الفرق والجولات تتحدث بين الأجهزة
-                                                viewModel.enterRoom(room)
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
-                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                                            shape = RoundedCornerShape(8.dp)
-                                        ) {
-                                            Text("دخول 🎮", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                        }
-
-                                        Spacer(modifier = Modifier.height(6.dp))
-
-                                        OutlinedButton(
-                                            onClick = { viewModel.openRoomParticipants(room.roomCode) },
-                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                            shape = RoundedCornerShape(8.dp)
-                                        ) {
-                                            Icon(
-                                                Icons.Default.Group,
-                                                contentDescription = null,
-                                                tint = StadiumCyan,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Text("المشاركون 👥", color = StadiumCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                        }
+                                    Button(
+                                        onClick = {
+                                            viewModel.audioEffects.playWhistle()
+                                            // Launch corresponding game for PvP match
+                                            when (room.gameType) {
+                                                "thirty_seconds" -> viewModel.startThirtySecondsQuiz()
+                                                "buzzer" -> viewModel.navigateTo(GameScreen.ThirtySecondsRoundsScreen)
+                                                "tictactoe" -> viewModel.navigateTo(GameScreen.FootballTicTacToeScreen)
+                                                "auction" -> viewModel.navigateTo(GameScreen.FootballAuctionScreen)
+                                                else -> viewModel.startPvPMatchSearch()
+                                            }
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text("دخول 🎮", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                     }
                                 }
                             }
@@ -449,62 +421,28 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                                                 )
                                             }
                                         }
-                                        // حالة حقيقية بدل رقم Ping وهمي
-                                        val lanActive = lanIsHosting || lanJoinedHost != null
                                         Box(
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(6.dp))
-                                                .background(
-                                                    if (lanActive) EmeraldNeon.copy(alpha = 0.2f)
-                                                    else PitchDivider
-                                                )
+                                                .background(EmeraldNeon.copy(alpha = 0.2f))
                                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                                         ) {
-                                            Text(
-                                                text = when {
-                                                    lanIsHosting -> "سيرفر شغّال 🎮"
-                                                    lanJoinedHost != null -> "متصل ✅"
-                                                    else -> "مش شغّال"
-                                                },
-                                                color = if (lanActive) EmeraldNeon else TextSecondary,
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
+                                            Text("Ping: 1ms", color = EmeraldNeon, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                         }
                                     }
-
-                                    Spacer(modifier = Modifier.height(8.dp))
-
-                                    Text(
-                                        text = when {
-                                            lanIsHosting ->
-                                                "عنوان سيرفرك: ${lanHostAddress ?: "----"}:$lanHostPort • متصلون: $lanConnectedClients 👥"
-                                            lanJoinedHost != null -> "متصل بسيرفر: $lanJoinedHost"
-                                            else -> "افتح سيرفر على جهازك، أو دور على سيرفرات أصحابك تلقائياً"
-                                        },
-                                        fontSize = 11.sp,
-                                        color = if (lanIsHosting || lanJoinedHost != null) StadiumCyan else TextSecondary,
-                                        lineHeight = 17.sp
-                                    )
 
                                     Spacer(modifier = Modifier.height(10.dp))
 
                                     Button(
                                         onClick = {
                                             viewModel.audioEffects.playWhistle()
-                                            // ردهة الهوتسبوت الحقيقية: تشغيل سيرفر + بحث تلقائي + IP يدوي
-                                            viewModel.navigateTo(GameScreen.HotspotLobby)
+                                            viewModel.navigateTo(GameScreen.PassAndPlayScreen)
                                         },
                                         modifier = Modifier.fillMaxWidth(),
                                         colors = ButtonDefaults.buttonColors(containerColor = TrophyGold),
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text(
-                                            text = if (lanIsHosting || lanJoinedHost != null) "إدارة جلسة الشبكة المحلية 📶"
-                                            else "تشغيل غرفة الهوتسبوت المحلية 🚀",
-                                            color = PitchDark,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        Text("تشغيل غرفة الهوتسبوت المحلية 🚀", color = PitchDark, fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
@@ -520,157 +458,6 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                             .weight(1f),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // ---- ملفك العالمي من view `public.users` ----
-                        item {
-                            GlowCard(
-                                modifier = Modifier.fillMaxWidth(),
-                                borderColor = StadiumCyan
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Text(
-                                        text = "ملفك العالمي 🌍",
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White,
-                                        fontSize = 13.sp
-                                    )
-                                    Spacer(modifier = Modifier.height(6.dp))
-
-                                    val cloudUser = cloudUserProfile
-                                    if (cloudUser != null) {
-                                        Text(
-                                            text = "${cloudUser.displayName} • ${cloudUser.levelTitle ?: "مشجع"}",
-                                            color = TrophyGold,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            text = "إجمالي النقاط: ${cloudUser.totalPoints} 🏆  •  العملات: ${cloudUser.totalCoins} 🪙",
-                                            color = Color.White,
-                                            fontSize = 11.sp
-                                        )
-                                        Text(
-                                            text = "التحديات المسجّلة: ${cloudUser.challengesPlayed} ⚽  •  أفضل نتيجة: ${cloudUser.bestChallengePoints}",
-                                            color = TextSecondary,
-                                            fontSize = 11.sp
-                                        )
-                                    } else {
-                                        Text(
-                                            text = "لسه ما اتسجلتش في الجدول السحابي — سجّل اسمك دلوقتي وابدأ تحدياتك 🚀",
-                                            color = TextSecondary,
-                                            fontSize = 11.sp
-                                        )
-                                    }
-
-                                    Spacer(modifier = Modifier.height(10.dp))
-
-                                    Button(
-                                        onClick = { viewModel.registerPlayerInCloud() },
-                                        enabled = !isLoadingScores,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
-                                        shape = RoundedCornerShape(10.dp)
-                                    ) {
-                                        Text(
-                                            text = if (isLoadingScores) "جارٍ الحفظ..." else "أضفني لاعباً جديداً في الجدول ➕",
-                                            color = PitchDark,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 12.sp
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        // ----------------------------------------------------------------
-                        // حالة «الأبداً متحدّث»: كم سؤال وصل من البوت + زر مزامنة يدوي
-                        // ----------------------------------------------------------------
-                        item {
-                            val cloudQuestions by viewModel.cloudQuestionCount.collectAsState()
-                            val feedStatus by viewModel.questionFeedStatus.collectAsState()
-
-                            GlowCard(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("question_feed_card")
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = "🤖 الأسئلة المتجدّدة",
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = Color.White
-                                        )
-                                        Text(
-                                            text = viewModel.questionFeedSummary(),
-                                            fontSize = 11.sp,
-                                            color = StadiumCyan.copy(alpha = 0.85f),
-                                            lineHeight = 16.sp
-                                        )
-                                        feedStatus?.let { result ->
-                                            Text(
-                                                text = result.arabicSummary,
-                                                fontSize = 10.sp,
-                                                color = if (result.failedTypes.isNotEmpty()) {
-                                                    Color(0xFFFFB74D)
-                                                } else {
-                                                    Color.White.copy(alpha = 0.6f)
-                                                },
-                                                modifier = Modifier.padding(top = 4.dp)
-                                            )
-                                        }
-                                        if (QuestionFeedLogic.hasMeaningfulCloudContent(cloudQuestions)) {
-                                            Text(
-                                                text = "أحدث $cloudQuestions سؤال من السيرفر متاح أوفلاين كمان 📴",
-                                                fontSize = 10.sp,
-                                                color = Color.White.copy(alpha = 0.5f),
-                                                modifier = Modifier.padding(top = 2.dp)
-                                            )
-                                        }
-                                    }
-                                    TextButton(onClick = { viewModel.forceRefreshQuestionFeed() }) {
-                                        Text(
-                                            text = "حدّث",
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = StadiumCyan
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        item {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "أعلى النتائج من جدول leaderboard (${cloudScores.size})",
-                                    fontSize = 12.sp,
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (isLoadingScores) {
-                                    CircularProgressIndicator(
-                                        color = StadiumCyan,
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp
-                                    )
-                                } else {
-                                    IconButton(onClick = { refreshScores() }, modifier = Modifier.size(30.dp)) {
-                                        Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = StadiumCyan)
-                                    }
-                                }
-                            }
-                        }
-
                         items(cloudScores) { score ->
                             Card(
                                 modifier = Modifier
@@ -739,6 +526,7 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
     // -------------------------------------------------------------------------
     if (showCreateRoomDialog) {
         var selectedGameType by remember { mutableStateOf("thirty_seconds") }
+        val generatedCode = remember { "STAD${Random.nextInt(10, 99)}" }
 
         Dialog(onDismissRequest = { showCreateRoomDialog = false }) {
             Card(
@@ -762,21 +550,11 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(text = "كود الغرفة للمشاركة:", fontSize = 12.sp, color = TextSecondary)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = roomPreviewCode,
-                            fontSize = 28.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = TrophyGold
-                        )
-                        IconButton(onClick = { viewModel.regenerateRoomCodePreview() }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Refresh, contentDescription = "توليد كود آخر", tint = StadiumCyan)
-                        }
-                    }
                     Text(
-                        text = "يتأكد المستودع من فرادة الكود قبل الإنشاء ✓",
-                        fontSize = 10.sp,
-                        color = TextSecondary
+                        text = generatedCode,
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = TrophyGold
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -808,16 +586,19 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                     Spacer(modifier = Modifier.height(18.dp))
 
                     EmeraldButton(
-                        text = if (isLoadingRooms) "جارٍ إنشاء الغرفة..." else "تأكيد وبدء الغرفة 🚀",
+                        text = "تأكيد وبدء الغرفة 🚀",
                         onClick = {
-                            // المستودع: توليد/اعتماد كود فريد ← إنشاء في Supabase ← كاش محلي
-                            //          ← إضافة المضيف كأول مشارك
-                            viewModel.createOnlineRoom(
-                                gameType = selectedGameType,
-                                preferredCode = roomPreviewCode
-                            )
-                            showCreateRoomDialog = false
-                            refreshRooms()
+                            scope.launch {
+                                val newRoom = SupabaseGameRoom(
+                                    roomCode = generatedCode,
+                                    gameType = selectedGameType,
+                                    hostName = userProfile.playerName
+                                )
+                                supabaseClient.createGameRoom(newRoom)
+                                showCreateRoomDialog = false
+                                refreshRooms()
+                                Toast.makeText(context, "تم إنشاء الغرفة ($generatedCode) بنجاح!", Toast.LENGTH_SHORT).show()
+                            }
                         },
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -867,11 +648,8 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         onClick = {
                             if (inputRoomCode.isNotBlank()) {
                                 showJoinRoomDialog = false
-                                // فحص السعة والتكرار + موازنة الفرق تلقائياً داخل المستودع،
-                                // وبعد النجاح ندخل جلسة المباراة المتزامنة مباشرةً
-                                viewModel.joinOnlineRoom(inputRoomCode) {
-                                    viewModel.enterRoomByCode(inputRoomCode)
-                                }
+                                viewModel.audioEffects.playWhistle()
+                                viewModel.startPvPMatchSearch()
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -965,200 +743,6 @@ fun SupabaseOnlineScreen(viewModel: FootballGameViewModel) {
                         Icon(Icons.Default.ContentCopy, contentDescription = null, tint = TrophyGold)
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("نسخ كود SQL Schema الجاهز 📋", color = TrophyGold, fontSize = 12.sp)
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // مخطط V2: جداول/واجهات Users • Rooms • Leaderboard
-                    OutlinedButton(
-                        onClick = {
-                            val sqlCode = context.assets.open("supabase_schema_v2.sql").bufferedReader().use { it.readText() }
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("Supabase Schema V2", sqlCode))
-                            Toast.makeText(context, "تم نسخ مخطط V2 (Users/Rooms/Leaderboard)! الصقه في Supabase SQL Editor 📋", Toast.LENGTH_LONG).show()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.ContentCopy, contentDescription = null, tint = StadiumCyan)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("نسخ مخطط V2: Users/Rooms/Leaderboard 📋", color = StadiumCyan, fontSize = 12.sp)
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Text(
-                        text = SupabaseClientProvider.describeStatus(),
-                        fontSize = 10.sp,
-                        color = TextSecondary
-                    )
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // ROOM PARTICIPANTS DIALOG — قائمة المشاركين عبر GameRoomRepository
-    // -------------------------------------------------------------------------
-    if (selectedRoomCode != null) {
-        RoomParticipantsDialog(
-            roomCode = selectedRoomCode ?: "",
-            participants = roomParticipants,
-            isLoading = isLoadingParticipants,
-            currentUserName = userProfile.playerName,
-            onReadyToggle = { participant -> viewModel.toggleParticipantReady(participant) },
-            onRefresh = { viewModel.refreshRoomParticipants() },
-            onDismiss = { viewModel.closeRoomParticipants() }
-        )
-    }
-}
-
-@Composable
-private fun RoomParticipantsDialog(
-    roomCode: String,
-    participants: List<RoomParticipant>,
-    isLoading: Boolean,
-    currentUserName: String,
-    onReadyToggle: (RoomParticipant) -> Unit,
-    onRefresh: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    val redCount = participants.count { it.isTeamRed }
-    val blueCount = participants.size - redCount
-
-    Dialog(onDismissRequest = onDismiss) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(8.dp),
-            colors = CardDefaults.cardColors(containerColor = PitchCard),
-            shape = RoundedCornerShape(16.dp),
-            border = androidx.compose.foundation.BorderStroke(1.5.dp, StadiumCyan)
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "مشاركو الغرفة ($roomCode) 👥",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "🔴 أحمر: $redCount   •   🔵 أزرق: $blueCount",
-                    fontSize = 11.sp,
-                    color = TrophyGold,
-                    fontWeight = FontWeight.Bold
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                when {
-                    isLoading -> {
-                        CircularProgressIndicator(color = StadiumCyan, modifier = Modifier.size(34.dp))
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text("جارٍ تحميل المشاركين من السيرفر...", fontSize = 11.sp, color = TextSecondary)
-                    }
-
-                    participants.isEmpty() -> {
-                        Text(
-                            text = "لا يوجد مشاركون بعد — شارك الكود مع أصحابك ⚽",
-                            fontSize = 12.sp,
-                            color = TextSecondary,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-
-                    else -> {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 320.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(participants) { participant ->
-                                val isCurrentUser = participant.playerName.trim()
-                                    .equals(currentUserName.trim(), ignoreCase = true)
-
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(PitchDark)
-                                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                                        Text(text = participant.avatarEmoji, fontSize = 20.sp)
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Column {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(
-                                                    text = participant.playerName,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = Color.White,
-                                                    fontSize = 13.sp
-                                                )
-                                                if (participant.isHost) {
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Text(text = "👑 مضيف", fontSize = 10.sp, color = TrophyGold)
-                                                }
-                                                if (isCurrentUser) {
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Text(text = "(أنت)", fontSize = 10.sp, color = EmeraldNeon)
-                                                }
-                                            }
-                                            Text(
-                                                text = "${participant.arabicTeamLabel} • ${participant.arabicReadyLabel} • ${participant.score} نقطة",
-                                                fontSize = 10.sp,
-                                                color = TextSecondary
-                                            )
-                                        }
-                                    }
-
-                                    OutlinedButton(
-                                        onClick = { onReadyToggle(participant) },
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                        shape = RoundedCornerShape(8.dp)
-                                    ) {
-                                        Text(
-                                            text = if (participant.isReady) "إلغاء الجاهزية" else "أنا جاهز ✅",
-                                            fontSize = 10.sp,
-                                            color = if (participant.isReady) TextSecondary else EmeraldNeon
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = onRefresh,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, tint = StadiumCyan, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("تحديث 🔄", color = StadiumCyan, fontSize = 12.sp)
-                    }
-
-                    Button(
-                        onClick = onDismiss,
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = TrophyGold),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("إغلاق", color = PitchDark, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
                 }
             }

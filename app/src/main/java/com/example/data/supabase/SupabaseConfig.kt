@@ -2,6 +2,7 @@ package com.example.data.supabase
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.example.BuildConfig
 
 object SupabaseConfig {
     private var customUrl: String? = null
@@ -14,21 +15,6 @@ object SupabaseConfig {
         customAnonKey = prefs?.getString("custom_supabase_anon_key", null)
     }
 
-    /**
-     * القيمة المحفوظة محلياً فقط (بدون .env ولا متغيرات البيئة).
-     * تُستخدم من [SupabaseEnv.resolve] كأول مصدر بعد الـ override.
-     */
-    val storedUrl: String?
-        get() = customUrl?.takeIf { it.isNotBlank() }
-
-    /** مرادف [storedUrl] لمفتاح Anon. */
-    val storedAnonKey: String?
-        get() = customAnonKey?.takeIf { it.isNotBlank() }
-
-    /** من أين جاءت قيم الاتصال الحالية (للعرض في شاشة الإعدادات/التشخيص). */
-    val credentialsSource: SupabaseCredentials.Source
-        get() = SupabaseEnv.resolve().source
-
     fun saveCredentials(context: Context, url: String, anonKey: String) {
         val sp = prefs ?: context.getSharedPreferences("malab_supabase_config", Context.MODE_PRIVATE)
         sp.edit()
@@ -39,21 +25,29 @@ object SupabaseConfig {
         customAnonKey = anonKey.trim()
     }
 
-    /**
-     * رابط مشروع Supabase.
-     * يُحسم عبر [SupabaseEnv.resolve]: التخزين المحلي ← متغيرات البيئة ← BuildConfig (.env).
-     */
     val url: String
-        get() = SupabaseEnv.resolve().url
+        get() {
+            if (!customUrl.isNullOrBlank()) return customUrl!!
+            return try {
+                BuildConfig.SUPABASE_URL
+            } catch (_: Exception) {
+                "https://xyzcompany.supabase.co"
+            }
+        }
 
-    /**
-     * مفتاح Anon العام.
-     * يُحسم بنفس أولوية [url].
-     */
     val anonKey: String
-        get() = SupabaseEnv.resolve().anonKey
+        get() {
+            if (!customAnonKey.isNullOrBlank()) return customAnonKey!!
+            return try {
+                BuildConfig.SUPABASE_ANON_KEY
+            } catch (_: Exception) {
+                ""
+            }
+        }
 
-    /** هل التطبيق مربوط فعلياً بمشروع Supabase صالح؟ */
     val isConfigured: Boolean
-        get() = SupabaseEnv.isConfigured()
+        get() = url.isNotBlank() &&
+                !url.contains("xyzcompany") &&
+                anonKey.isNotBlank() &&
+                !anonKey.contains("dummy")
 }
