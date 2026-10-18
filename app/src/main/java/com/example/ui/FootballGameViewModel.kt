@@ -7,11 +7,28 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.StadiumAudioEffects
 import com.example.data.*
+import com.example.data.lan.DiscoveredHost
+import com.example.data.lan.LanGameManager
+import com.example.data.lan.LanProtocol
 import com.example.data.room.CumulativePlayerStat
 import com.example.data.room.GameHighScoreStat
+import com.example.data.room.GameRoom
+import com.example.data.room.GameRoomRepository
 import com.example.data.room.OfflineRepository
 import com.example.data.room.OfflineSyncResult
 import com.example.data.room.PartyLeaderboardRecordEntity
+import com.example.data.room.RoomParticipant
+import com.example.data.room.RoomTeamScores
+import com.example.data.room.failureMessageOrNull
+import com.example.data.room.getOrNull
+import com.example.data.supabase.RealtimeEvent
+import com.example.data.supabase.SupabaseClientProvider
+import com.example.data.supabase.SupabaseRealtimeClient
+import com.example.data.supabase.SupabaseScore
+import com.example.data.supabase.SupabaseUser
+import com.example.data.supabase.addNewPlayer
+import com.example.data.questions.QuestionFeedLogic
+import com.example.data.questions.QuestionFeedRepository
 import com.example.data.daily.DailyChallenge
 import com.example.data.daily.DailyChallengeManager
 import com.example.data.ai.GeminiSpeechAuditor
@@ -25,11 +42,13 @@ import com.example.data.voice.SpeechState
 import com.example.notifications.StadiumNotificationManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -66,6 +85,15 @@ sealed class GameScreen {
     object TruthOrDareScreen : GameScreen()
     object ThirtySecondsRoundsScreen : GameScreen()
     object SupabaseOnlineScreen : GameScreen()
+
+    /** غرفة المباراة المباشرة: مشاركون لحظيون + نتائج الفرق + تحكم المضيف. */
+    object RoomMatch : GameScreen()
+
+    /**
+     * ردهة الهوتسبوت/الشبكة المحلية: تشغيل سيرفر، بحث تلقائي عن سيرفرات،
+     * أو اتصال يدوي بعنوان IP.
+     */
+    object HotspotLobby : GameScreen()
 }
 
 class FootballGameViewModel(application: Application) : AndroidViewModel(application) {
@@ -75,6 +103,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     val dailyChallengeManager = DailyChallengeManager(application)
     val voicePermissionRepository = VoicePermissionRepository(application)
     val speechToTextManager = SpeechToTextManager(application)
+
+    /** مستودع الغرف الأونلاين: DAO محلي (Room) + DAO بعيد (Supabase). */
+    val gameRoomRepository = GameRoomRepository.get(application)
 
     private val _dailyChallenge = MutableStateFlow(dailyChallengeManager.getTodayChallenge())
     val dailyChallenge: StateFlow<DailyChallenge> = _dailyChallenge.asStateFlow()
@@ -419,6 +450,661 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     }
 
     // =========================================================================
+    // ONLINE GAME ROOMS: إنشاء الغرف وقائمة المشاركين (Supabase + كاش محلي)
+    // =========================================================================
+    /**
+     * قائمة الغرف من الكاش المحلي عبر Flow (Offline-first).
+     * إذا كانت القائمة فارغة نعرض غرفاً تجريبية حتى تبقى الشاشة حيّة بدون سيرفر.
+     */
+    val onlineRooms: StateFlow<List<GameRoom>> = gameRoomRepository.observeRooms()
+        .map { rooms -> if (rooms.isEmpty()) demoOnlineRooms() else rooms }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), demoOnlineRooms())
+
+    private val _onlineRoomParticipants = MutableStateFlow<List<RoomParticipant>>(emptyList())
+    val onlineRoomParticipants: StateFlow<List<RoomParticipant>> = _onlineRoomParticipants.asStateFlow()
+
+    private val _selectedRoomCode = MutableStateFlow<String?>(null)
+    val selectedRoomCode: StateFlow<String?> = _selectedRoomCode.asStateFlow()
+
+    private val _isLoadingParticipants = MutableStateFlow(false)
+    val isLoadingParticipants: StateFlow<Boolean> = _isLoadingParticipants.asStateFlow()
+
+    private val _isRoomActionBusy = MutableStateFlow(false)
+    val isRoomActionBusy: StateFlow<Boolean> = _isRoomActionBusy.asStateFlow()
+
+    private val _roomActionMessage = MutableStateFlow<String?>(null)
+    val roomActionMessage: StateFlow<String?> = _roomActionMessage.asStateFlow()
+
+    private val _lastCreatedRoomCode = MutableStateFlow<String?>(null)
+    val lastCreatedRoomCode: StateFlow<String?> = _lastCreatedRoomCode.asStateFlow()
+
+    /** كود مقترح يظهر في حوار الإنشاء، ويتأكد المستودع من فرادته قبل الاعتماد. */
+    private val _roomPreviewCode = MutableStateFlow(gameRoomRepository.generateRoomCode())
+    val roomPreviewCode: StateFlow<String> = _roomPreviewCode.asStateFlow()
+
+    fun regenerateRoomCodePreview() {
+        _roomPreviewCode.value = gameRoomRepository.generateRoomCode()
+    }
+
+    fun dismissRoomActionMessage() {
+        _roomActionMessage.value = null
+    }
+
+    /** سحب أحدث الغرف من Supabase وتحديث الكاش المحلي. */
+    fun loadOnlineRooms(limit: Int = GameRoomRepository.DEFAULT_FETCH_LIMIT) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            gameRoomRepository.refreshRooms(limit)
+            _isRoomActionBusy.value = false
+        }
+    }
+
+    /** إنشاء غرفة جديدة باسم المضيف الحالي وإضافته كأول مشارك. */
+    fun createOnlineRoom(gameType: String, preferredCode: String?) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            val profile = repository.userProfile.value
+            val result = gameRoomRepository.createRoom(
+                hostName = profile.playerName,
+                gameType = gameType,
+                hostAvatar = profile.avatarEmoji,
+                preferredCode = preferredCode
+            )
+            _isRoomActionBusy.value = false
+
+            val room = result.getOrNull()
+            if (room != null) {
+                audioEffects.playWhistle()
+                _lastCreatedRoomCode.value = room.roomCode
+                _roomPreviewCode.value = gameRoomRepository.generateRoomCode()
+                _roomActionMessage.value = if (room.isOfflineOnly) {
+                    "تم إنشاء الغرفة (${room.roomCode}) محلياً 📴 ستُزامَن مع السيرفر تلقائياً"
+                } else {
+                    "تم إنشاء الغرفة (${room.roomCode}) بنجاح ⚽ شارك الكود مع أصحابك"
+                }
+                _selectedRoomCode.value = room.roomCode
+                loadParticipants(room.roomCode)
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = result.failureMessageOrNull() ?: "تعذّر إنشاء الغرفة ⛔"
+            }
+        }
+    }
+
+    /** انضمام لاعب لغرفة بكودها، ثم [onJoined] عند النجاح. */
+    fun joinOnlineRoom(roomCode: String, onJoined: () -> Unit = {}) {
+        viewModelScope.launch {
+            _isRoomActionBusy.value = true
+            val profile = repository.userProfile.value
+            val result = gameRoomRepository.joinRoom(
+                roomCode = roomCode,
+                playerName = profile.playerName,
+                avatarEmoji = profile.avatarEmoji
+            )
+            _isRoomActionBusy.value = false
+
+            val room = result.getOrNull()
+            if (room != null) {
+                audioEffects.playWhistle()
+                _selectedRoomCode.value = room.roomCode
+                _roomActionMessage.value = "انضممت إلى الغرفة (${room.roomCode}) 🎮"
+                loadParticipants(room.roomCode)
+                onJoined()
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = result.failureMessageOrNull() ?: "تعذّر الانضمام للغرفة ⛔"
+            }
+        }
+    }
+
+    /** فتح قائمة مشاركي غرفة (من السيرفر مع رجوع تلقائي للكاش). */
+    fun openRoomParticipants(roomCode: String) {
+        audioEffects.playClick()
+        _selectedRoomCode.value = roomCode
+        viewModelScope.launch { loadParticipants(roomCode) }
+    }
+
+    fun refreshRoomParticipants() {
+        val code = _selectedRoomCode.value ?: return
+        viewModelScope.launch { loadParticipants(code) }
+    }
+
+    fun closeRoomParticipants() {
+        _selectedRoomCode.value = null
+        _onlineRoomParticipants.value = emptyList()
+    }
+
+    private suspend fun loadParticipants(roomCode: String) {
+        _isLoadingParticipants.value = true
+        val result = gameRoomRepository.listParticipants(roomCode)
+        _onlineRoomParticipants.value = result.getOrNull().orEmpty()
+        _isLoadingParticipants.value = false
+    }
+
+    /** تبديل جاهزية مشارك ثم تحديث القائمة. */
+    fun toggleParticipantReady(participant: RoomParticipant) {
+        viewModelScope.launch {
+            gameRoomRepository.setParticipantReady(
+                roomCode = participant.roomCode,
+                playerName = participant.playerName,
+                isReady = !participant.isReady
+            )
+            loadParticipants(participant.roomCode)
+        }
+    }
+
+    /** دفع الغرف والمشاركين المُنشأة أوفلاين إلى Supabase. */
+    fun syncPendingOnlineRooms() {
+        viewModelScope.launch {
+            val synced = gameRoomRepository.syncPendingRooms()
+            if (synced > 0) {
+                audioEffects.playCorrect()
+                _roomActionMessage.value = "تمت مزامنة $synced غرفة مع السيرفر ☁️"
+            }
+        }
+    }
+
+    // =========================================================================
+    // CLOUD USERS & LEADERBOARD: جداول users و leaderboard في Supabase
+    // =========================================================================
+    /** أعلى النتائج من view `public.leaderboard`. */
+    private val _cloudLeaderboard = MutableStateFlow<List<SupabaseScore>>(emptyList())
+    val cloudLeaderboard: StateFlow<List<SupabaseScore>> = _cloudLeaderboard.asStateFlow()
+
+    /** ملف اللاعب الحالي من view `public.users` (إجمالي نقاطه وتحدياته). */
+    private val _cloudUserProfile = MutableStateFlow<SupabaseUser?>(null)
+    val cloudUserProfile: StateFlow<SupabaseUser?> = _cloudUserProfile.asStateFlow()
+
+    private val _isCloudLeaderboardLoading = MutableStateFlow(false)
+    val isCloudLeaderboardLoading: StateFlow<Boolean> = _isCloudLeaderboardLoading.asStateFlow()
+
+    /** سحب لوحة الصدارة وملف اللاعب من Supabase. */
+    fun loadCloudLeaderboard() {
+        viewModelScope.launch { loadCloudLeaderboardData() }
+    }
+
+    private suspend fun loadCloudLeaderboardData() {
+        _isCloudLeaderboardLoading.value = true
+        val userDao = SupabaseClientProvider.userDao()
+
+        val scores = runCatching { userDao.fetchLeaderboard(CLOUD_LEADERBOARD_LIMIT) }.getOrNull()
+        _cloudLeaderboard.value = if (!scores.isNullOrEmpty()) scores else demoCloudScores()
+
+        val profileName = repository.userProfile.value.playerName
+        _cloudUserProfile.value = runCatching { userDao.fetchUserByName(profileName) }.getOrNull()
+
+        _isCloudLeaderboardLoading.value = false
+    }
+
+    /**
+     * تسجيل اللاعب الحالي في الجدول السحابي عبر الدالة البسيطة [addNewPlayer]
+     * (إدراج في `leaderboard` ⇒ يظهر تلقائياً في `users`).
+     */
+    fun registerPlayerInCloud() {
+        viewModelScope.launch {
+            _isCloudLeaderboardLoading.value = true
+            val profile = repository.userProfile.value
+
+            val registered = runCatching {
+                addNewPlayer(
+                    playerName = profile.playerName,
+                    points = profile.points,
+                    coins = profile.coins,
+                    levelTitle = profile.levelTitle,
+                    favoriteClub = profile.favoriteClub,
+                    challengeType = "general"
+                )
+            }.getOrDefault(false)
+
+            _isCloudLeaderboardLoading.value = false
+
+            if (registered) {
+                audioEffects.playVictory()
+                _roomActionMessage.value = "تم تسجيلك في لوحة الصدارة العالمية 🌍🏆"
+                loadCloudLeaderboardData()
+            } else {
+                audioEffects.playWrong()
+                _roomActionMessage.value = "تعذّر التسجيل — تأكد من إعدادات Supabase 🔌"
+            }
+        }
+    }
+
+    // =========================================================================
+    // LIVE ROOM MATCH SESSION — تزامن اللعب نفسه بين الأجهزة
+    // =========================================================================
+    // الفكرة: أي لعبة موجودة بتسجّل نقاطها عبر recordPartyGameScore (15 موضعاً)،
+    // لذلك نربط الدفع للغرفة هناك مرة واحدة ⇒ كل الألعاب تتزامن تلقائياً
+    // بدون تعديل أي شاشة لعبة.
+    // =========================================================================
+
+    /** كود الغرفة الحالية، أو null لو مش جوه مباراة. */
+    private val _activeRoomCode = MutableStateFlow<String?>(null)
+    val activeRoomCode: StateFlow<String?> = _activeRoomCode.asStateFlow()
+
+    private val _activeRoom = MutableStateFlow<GameRoom?>(null)
+    val activeRoom: StateFlow<GameRoom?> = _activeRoom.asStateFlow()
+
+    private val _activeRoomParticipants = MutableStateFlow<List<RoomParticipant>>(emptyList())
+    val activeRoomParticipants: StateFlow<List<RoomParticipant>> = _activeRoomParticipants.asStateFlow()
+
+    /** حصيلة الفرق (أحمر/أزرق) محسوبة لحظياً من المشاركين. */
+    private val _roomTeamScores = MutableStateFlow(RoomTeamScores.EMPTY)
+    val roomTeamScores: StateFlow<RoomTeamScores> = _roomTeamScores.asStateFlow()
+
+    /** هل اللاعب الحالي هو مضيف الغرفة؟ (يظهر له أزرار التحكم بالجولات) */
+    private val _isRoomSessionHost = MutableStateFlow(false)
+    val isRoomSessionHost: StateFlow<Boolean> = _isRoomSessionHost.asStateFlow()
+
+    private var roomSessionJob: Job? = null
+
+    /**
+     * عميل الاشتراك اللحظي (Supabase Realtime / Phoenix WebSocket).
+     *
+     * بيتبني مرة واحدة وبيفضل عائم لحد ما جلسه تبدأ. البناء نفسه رخيص
+     * (مفيش socket لحد [SupabaseRealtimeClient.subscribeToRoom]).
+     */
+    private val realtimeClient = SupabaseRealtimeClient(
+        onEvent = { event -> onRealtimeChange(event) }
+    )
+
+    /** هل الدفع اللحظي شغال؟ (يُعرض في الواجهة بدل رقم Ping وهمي) */
+    val realtimeConnected: StateFlow<Boolean> = realtimeClient.isConnected
+
+    /**
+     * حالة الاشتراك اللحظي — بتمرر من العميل نفسه مباشرةً، لأن العميل
+     * بيحدّثها في كل المسارات (نجاح/رفض/انقطاع) ومفيش سبب إن الـVM يعمل نسخة.
+     */
+    val realtimeStatus: StateFlow<String?> = realtimeClient.statusMessage
+
+    /** تجميع الانفجارات: عدة تغييرات في نفس اللحظة = تحديث واحد. */
+    private var realtimeRefreshJob: Job? = null
+
+    private fun onRealtimeChange(event: RealtimeEvent) {
+        if (!event.isRoomChange) return
+        realtimeRefreshJob?.cancel()
+        realtimeRefreshJob = viewModelScope.launch {
+            delay(REALTIME_REFRESH_DEBOUNCE_MS)
+            syncRoomSessionOnce()
+        }
+    }
+
+    /**
+     * الاشتراك اللحظي بيُفعّل على السحابة بس: في وضع الهوتسبوت مفيش
+     * Supabase من الأساس، والدفع بيتم من الـkeep-alive بتاع السيرفر المحلي.
+     */
+    private fun startRealtimeSubscription(roomCode: String) {
+        if (!SupabaseClientProvider.isConfigured() || LanGameManager.isLanActive()) {
+            // مفيش سحابة نتشترك معاها: نمسح أي رسالة قديمة وسِب الحلبة
+            // الدورية تشتغل، بدل ما اللاعب يقرا «اتصال لحظي شغّال» كاذبة
+            realtimeClient.clearStatus()
+            return
+        }
+        // العميل نفسه بيحط رسالة عربية في كل مسار فشل، فمفيش حاجة تانية نقولها هنا
+        realtimeClient.subscribeToRoom(roomCode)
+    }
+
+    private fun stopRealtimeSubscription() {
+        realtimeRefreshJob?.cancel()
+        realtimeRefreshJob = null
+        realtimeClient.unsubscribe()
+        realtimeClient.clearStatus()
+    }
+
+    /**
+     * دخول غرفة وبدء جلسة متزامنة: يفتح شاشة المباراة ويشغّل حلقة تحديث
+     * تجيب حالة الغرفة والمشاركين كل [ROOM_SESSION_POLL_MS] مللي ثانية،
+     * كطريق احتياطي لو الاشتراك اللحظي ماشتغلش.
+     */
+    fun enterRoom(room: GameRoom) {
+        audioEffects.playWhistle()
+        _activeRoomCode.value = room.roomCode
+        _activeRoom.value = room
+        _isRoomSessionHost.value = isCurrentPlayer(room.hostName)
+        navigateTo(GameScreen.RoomMatch)
+        startRoomSessionLoop()
+        startRealtimeSubscription(room.roomCode)
+    }
+
+    /** دخول بالكود مباشرةً (بعد joinRoom) بدون الحاجة لكائن الغرفة في الشاشة. */
+    fun enterRoomByCode(roomCode: String) {
+        viewModelScope.launch {
+            val room = gameRoomRepository.getRoom(roomCode)
+            if (room != null) {
+                enterRoom(room)
+            } else {
+                _roomActionMessage.value = GameRoomRepository.ERROR_ROOM_NOT_FOUND
+            }
+        }
+    }
+
+    /** الخروج من الغرفة وإيقاف حلقة التحديث والاشتراك اللحظي (الغرفة نفسها ما تتحذفش). */
+    fun leaveRoom() {
+        roomSessionJob?.cancel()
+        roomSessionJob = null
+        stopRealtimeSubscription()
+        _activeRoomCode.value = null
+        _activeRoom.value = null
+        _activeRoomParticipants.value = emptyList()
+        _roomTeamScores.value = RoomTeamScores.EMPTY
+        _isRoomSessionHost.value = false
+
+        // نرجع للخلف (pop) بدل دفع شاشة جديدة فوق المكدس، وإلا زر الرجوع
+        // هيفضل يلف بين نسختين من شاشة الغرف
+        if (_currentScreen.value == GameScreen.RoomMatch) {
+            navigateBack()
+        } else {
+            navigateTo(GameScreen.SupabaseOnlineScreen)
+        }
+    }
+
+    private fun startRoomSessionLoop() {
+        roomSessionJob?.cancel()
+        roomSessionJob = viewModelScope.launch {
+            // أول تحديث فوري حتى لا تشاهد الشاشة حالة قديمة
+            syncRoomSessionOnce()
+            while (isActive) {
+                // لو الدفع اللحظي شغال فالحلقة مجرد شبكة أمان ⇒ تبطّئ،
+                // وإلا هي مصدر التحديث الوحيد ⇒ تسريع
+                val waitMs = if (realtimeClient.isConnected.value) {
+                    ROOM_SESSION_IDLE_POLL_MS
+                } else {
+                    ROOM_SESSION_POLL_MS
+                }
+                delay(waitMs)
+                syncRoomSessionOnce()
+            }
+        }
+    }
+
+    /** سحب حالة الغرفة + المشاركين مرة واحدة وتحديث الحصيلة. */
+    private suspend fun syncRoomSessionOnce() {
+        val code = _activeRoomCode.value ?: return
+        val room = gameRoomRepository.getRoom(code)
+        if (room != null) _activeRoom.value = room
+
+        val participants = gameRoomRepository.listParticipants(code).getOrNull().orEmpty()
+        _activeRoomParticipants.value = participants
+        _roomTeamScores.value = RoomTeamScores.from(participants)
+    }
+
+    /** تحديث يدوي من الواجهة (زر 🔄). */
+    fun refreshRoomSession() {
+        viewModelScope.launch { syncRoomSessionOnce() }
+    }
+
+    // ------------------------- تحكم المضيف بالجولات -------------------------
+
+    fun hostStartGame() {
+        viewModelScope.launch {
+            val code = _activeRoomCode.value ?: return@launch
+            audioEffects.playWhistle()
+            gameRoomRepository.startGame(code)
+            syncRoomSessionOnce()
+        }
+    }
+
+    fun hostNextRound() {
+        viewModelScope.launch {
+            val code = _activeRoomCode.value ?: return@launch
+            audioEffects.playClick()
+            gameRoomRepository.advanceRound(code)
+            syncRoomSessionOnce()
+        }
+    }
+
+    fun hostFinishGame() {
+        viewModelScope.launch {
+            val code = _activeRoomCode.value ?: return@launch
+            audioEffects.playVictory()
+            gameRoomRepository.finishGame(code)
+            syncRoomSessionOnce()
+        }
+    }
+
+    /**
+     * تشغيل جولة اللعبة الفعلية حسب نوع الغرفة.
+     * النقاط اللي هتسجّلها اللعبة هتتدفع للغرفة تلقائياً عبر
+     * [recordPartyGameScore] ⇒ باقي الأجهزة تشوفها في التحديث التالي.
+     */
+    fun launchRoomRound() {
+        val room = _activeRoom.value ?: return
+        audioEffects.playClick()
+        when (room.gameType) {
+            "thirty_seconds" -> startThirtySecondsQuiz()
+            "buzzer" -> navigateTo(GameScreen.ThirtySecondsRoundsScreen)
+            "tictactoe" -> navigateTo(GameScreen.FootballTicTacToeScreen)
+            "auction" -> navigateTo(GameScreen.FootballAuctionScreen)
+            "sabaho" -> startSabahoChallenge()
+            else -> startPvPMatchSearch()
+        }
+    }
+
+    /** رجوع لشاشة الغرفة بعد ما تخلّص الجولة (بدون إنهاء الجلسة). */
+    fun backToRoomMatch() {
+        if (_activeRoomCode.value != null) navigateTo(GameScreen.RoomMatch) else navigateBack()
+    }
+
+    /**
+     * دفع نقاط اللاعب الحالي للغرفة (تُستدعى تلقائياً من [recordPartyGameScore]).
+     * لو مش جوه غرفة ⇒ لا شيء يحدث، فالألعاب العادية تتصرف زي ما هي.
+     */
+    private suspend fun pushScoreToActiveRoom(earnedScore: Int) {
+        val code = _activeRoomCode.value ?: return
+        if (earnedScore <= 0) return
+
+        val myName = repository.userProfile.value.playerName
+        val me = _activeRoomParticipants.value.firstOrNull {
+            it.playerName.trim().equals(myName.trim(), ignoreCase = true)
+        } ?: return
+
+        gameRoomRepository.updateParticipantScore(code, me.playerName, me.score + earnedScore)
+        syncRoomSessionOnce()
+    }
+
+    private fun isCurrentPlayer(name: String): Boolean =
+        name.trim().equals(repository.userProfile.value.playerName.trim(), ignoreCase = true)
+
+    // =========================================================================
+    // LIVE QUESTION FEED — أسئلة البوت توصل اللعبة فعلاً
+    // =========================================================================
+    // كل الأسئلة كانت مكتوبة listOf(...) جوه FootballRepository، يعني مقفولة
+    // داخل الـAPK: أي سؤال بيضيفه البوت في Supabase ما كانش بيوصل اللاعب.
+    // الـStateFlows دي بتقرأ الكاش المحلي (Room) مدموجاً مع القائمة المضمّنة،
+    // فاللعبة تاخد الأحدث دايمًا وترجع للمضمّن لو السحابة فاضية أو النت واقع.
+    // =========================================================================
+
+    private val questionFeed = QuestionFeedRepository.get(application)
+
+    private val _questionFeedStatus = MutableStateFlow<QuestionFeedRepository.SyncResult?>(null)
+    val questionFeedStatus: StateFlow<QuestionFeedRepository.SyncResult?> = _questionFeedStatus.asStateFlow()
+
+    val liveThirtySeconds: StateFlow<List<ThirtySecondsQuestion>> =
+        questionFeed.thirtySeconds(repository.getThirtySecondsQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getThirtySecondsQuestions()
+            )
+
+    val liveSabaho: StateFlow<List<SabahoQuestion>> =
+        questionFeed.sabaho(repository.getSabahoQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getSabahoQuestions()
+            )
+
+    val liveTrueFalse: StateFlow<List<TrueFalseQuestion>> =
+        questionFeed.trueFalse(repository.getTrueFalseQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getTrueFalseQuestions()
+            )
+
+    val livePvp: StateFlow<List<PvPQuestion>> =
+        questionFeed.pvp(repository.getPvPQuestions())
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5_000),
+                repository.getPvPQuestions()
+            )
+
+    /** عدد الأسئلة السحابية المخزّنة محلياً — للعرض في الإعدادات. */
+    val cloudQuestionCount: StateFlow<Int> = questionFeed.observeCloudCount()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    /** آخر مرة جابنا فيها من السيرفر — عشان ما نفتحش طلب كل ما اللاعب يفتح لعبة. */
+    private var lastFeedRefreshAtMillis = 0L
+
+    init {
+        // أول مزامنة عند تجهيز الـViewModel (بتغطي فتح التطبيق وتغيير الشبكة)
+        maybeRefreshQuestionFeed()
+    }
+
+    /**
+     * مزامنة لو عدّت [QUESTION_FEED_MIN_REFRESH_MS] على آخر محاولة.
+     * بتتنادى قبل بدء أي لعبة، فمفيش حاجة تانية محتاجها في الخلفية.
+     */
+    fun maybeRefreshQuestionFeed() {
+        val now = System.currentTimeMillis()
+        if (now - lastFeedRefreshAtMillis < QUESTION_FEED_MIN_REFRESH_MS) return
+        lastFeedRefreshAtMillis = now
+        viewModelScope.launch {
+            _questionFeedStatus.value = questionFeed.refresh()
+        }
+    }
+
+    /** مزامنة قسرية من شاشة الإعدادات (زر «حدّث الأسئلة»). */
+    fun forceRefreshQuestionFeed() {
+        lastFeedRefreshAtMillis = System.currentTimeMillis()
+        viewModelScope.launch {
+            audioEffects.playClick()
+            _questionFeedStatus.value = questionFeed.refresh()
+        }
+    }
+
+    fun dismissQuestionFeedStatus() {
+        _questionFeedStatus.value = null
+    }
+
+    /** وصف عربي لحالة الأسئلة — بيشمل عدد أسئلة البوت اللي وصلت فعلاً. */
+    fun questionFeedSummary(): String =
+        QuestionFeedLogic.describeFeed(
+            cloudCount = cloudQuestionCount.value,
+            builtinCount = repository.getThirtySecondsQuestions().size +
+                repository.getSabahoQuestions().size +
+                repository.getTrueFalseQuestions().size +
+                repository.getPvPQuestions().size
+        )
+
+
+    // =========================================================================
+    // LAN / HOTSPOT MULTIPLAYER — لعب على الشبكة المحلية بدون إنترنت
+    // =========================================================================
+    // الحالة مملوكة لـ LanGameManager (لأنها بتعيش أطول من الـViewModel:
+    // السيرفر لازم يفضل شغّال لو اتلفّت الشاشة)، والـViewModel بيمرّرها
+    // للواجهة وبيغلّف الأوامر — بنفس نمط باقي الـflows في المشروع.
+    // =========================================================================
+
+    init {
+        // المضيف بيتعرّف على نفسه باسم اللاعب الحالي، والقيم بتتقرا لحظياً
+        // عشان لو اللاعب غيّر اسمه بعدين السيرفر يستخدم الاسم الجديد
+        LanGameManager.currentNameProvider = { repository.userProfile.value.playerName }
+        LanGameManager.currentAvatarProvider = { repository.userProfile.value.avatarEmoji }
+    }
+
+    val lanIsHosting: StateFlow<Boolean> = LanGameManager.isHosting
+    val lanHostAddress: StateFlow<String?> = LanGameManager.hostAddress
+    val lanHostPort: StateFlow<Int> = LanGameManager.hostPort
+    val lanDiscoveredHosts: StateFlow<List<DiscoveredHost>> = LanGameManager.discoveredHosts
+    val lanIsDiscovering: StateFlow<Boolean> = LanGameManager.isDiscovering
+    val lanJoinedHost: StateFlow<String?> = LanGameManager.joinedHost
+    val lanIsBusy: StateFlow<Boolean> = LanGameManager.isBusy
+    val lanMessage: StateFlow<String?> = LanGameManager.lanMessage
+    val lanConnectedClientCount: StateFlow<Int> = LanGameManager.connectedClientCount
+
+    /** تشغيل سيرفر اللعبة على الجهاز ده (الهوتسبوت أو الواي فاي المنزلي). */
+    fun startLanHosting(port: Int = LanProtocol.DEFAULT_GAME_PORT) {
+        viewModelScope.launch {
+            audioEffects.playClick()
+            val message = LanGameManager.startHosting(port)
+            if (message.contains("شغّال")) {
+                audioEffects.playWhistle()
+                // نحدّث قائمة الغرف عشان الغرفة المحلية تظهر فوراً
+                loadOnlineRooms()
+            }
+        }
+    }
+
+    /** إيقاف السيرفر المحلي. */
+    fun stopLanHosting() {
+        audioEffects.playClick()
+        LanGameManager.stopHosting()
+        loadOnlineRooms()
+    }
+
+    /** الاتصال بسيرفر مضيف بعنوان IP (الطريقة اليدوية الاحتياطية). */
+    fun connectToLanHost(hostIp: String, port: Int = LanProtocol.DEFAULT_GAME_PORT) {
+        viewModelScope.launch {
+            audioEffects.playClick()
+            val message = LanGameManager.connectToHost(hostIp, port)
+            if (message.startsWith("اتصلت")) {
+                audioEffects.playVictory()
+                loadOnlineRooms()
+            }
+        }
+    }
+
+    /** الاتصال بسيرفر مكتشف تلقائياً. */
+    fun connectToDiscoveredHost(host: DiscoveredHost) {
+        connectToLanHost(host.hostIp, host.port)
+    }
+
+    /** قطع الاتصال بسيرفر مضيف. */
+    fun disconnectFromLanHost() {
+        audioEffects.playClick()
+        LanGameManager.disconnectFromHost()
+        loadOnlineRooms()
+    }
+
+    /** بدء البحث التلقائي عن سيرفرات على نفس الشبكة (بثّ UDP). */
+    fun startLanDiscovery() {
+        LanGameManager.startDiscovery()
+    }
+
+    /** إعادة البحث التلقائي. */
+    fun refreshLanDiscovery() {
+        audioEffects.playClick()
+        LanGameManager.refreshDiscovery()
+    }
+
+    /** إيقاف البحث التلقائي. */
+    fun stopLanDiscovery() {
+        LanGameManager.stopDiscovery()
+    }
+
+    fun dismissLanMessage() {
+        LanGameManager.dismissMessage()
+    }
+
+    /** وصف عربي كامل لحالة الشبكة المحلية — يُعرض في واجهة الهوتسبوت. */
+    fun describeLanStatus(): String = LanGameManager.describeStatus()
+
+    /** عنوان IP لجهاز اللاعب — يُقرأ للأصحاب لو الاكتشاف التلقائي فشل. */
+    fun myLanIpAddress(): String? = LanGameManager.myIpAddress()
+
+    /** هل العنوان ده على نفس شبكة الجهاز؟ (تلميح قبل محاولة الاتصال) */
+    fun isSameSubnetAsDevice(remoteIp: String?): Boolean =
+        LanGameManager.isSameSubnetAsDevice(remoteIp)
+
+    /** تحديث عدد المتصلين بالسيرفر (يستدعى دورياً من الواجهة). */
+    fun refreshLanClientCount() {
+        LanGameManager.updateClientCount()
+    }
+
+
+    // =========================================================================
     // ROOM PERSISTENCE: CUMULATIVE PARTY & GATHERING LEADERBOARD
     // =========================================================================
     private val _leaderboardCategoryFilter = MutableStateFlow("all") // "all", "party", "football"
@@ -481,6 +1167,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
                 score = score,
                 details = details
             )
+            // لو اللاعب جوه غرفة ⇒ نفس النقاط تتدفع للغرفة فيشوفها باقي الأجهزة
+            pushScoreToActiveRoom(score)
+
             val newlyCompleted = dailyChallengeManager.reportGameScore(gameType, score)
             _dailyChallenge.value = dailyChallengeManager.getTodayChallenge()
             if (newlyCompleted) {
@@ -666,7 +1355,9 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     private var tsTimerJob: Job? = null
 
     fun startThirtySecondsQuiz() {
-        val questions = repository.getThirtySecondsQuestions().shuffled()
+        // بنقرأ من الـfeed الحي: أسئلة البوت الأول + المضمّن بدون تكرار
+        maybeRefreshQuestionFeed()
+        val questions = liveThirtySeconds.value.shuffled().take(ROUND_LENGTH_THIRTY_SECONDS)
         _tsQuestions.value = questions
         _tsCurrentIndex.value = 0
         _tsScore.value = 0
@@ -854,7 +1545,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     private var sabahoTimerJob: Job? = null
 
     fun startSabahoChallenge() {
-        val questions = repository.getSabahoQuestions().shuffled()
+        maybeRefreshQuestionFeed()
+        val questions = liveSabaho.value.shuffled().take(ROUND_LENGTH_SABAHO)
         _sabahoQuestions.value = questions
         _sabahoIndex.value = 0
         _sabahoScore.value = 0
@@ -1116,7 +1808,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     val tfExplanationVisible: StateFlow<Boolean> = _tfExplanationVisible.asStateFlow()
 
     fun startTrueFalseGame() {
-        val list = repository.getTrueFalseQuestions().shuffled()
+        maybeRefreshQuestionFeed()
+        val list = liveTrueFalse.value.shuffled().take(ROUND_LENGTH_TRUE_FALSE)
         _tfQuestions.value = list
         _tfIndex.value = 0
         _tfStreak.value = 0
@@ -1321,7 +2014,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
         viewModelScope.launch {
             delay(2200) // Simulate finding opponent
-            pvpQuestions = repository.getPvPQuestions().shuffled().take(5)
+            maybeRefreshQuestionFeed()
+            pvpQuestions = livePvp.value.shuffled().take(5)
             if (pvpQuestions.isNotEmpty()) {
                 val q1 = pvpQuestions[0]
                 _pvpState.value = _pvpState.value.copy(
@@ -1584,7 +2278,8 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
         viewModelScope.launch {
             delay(1800) // Simulated room join
-            pvpQuestions = repository.getPvPQuestions().shuffled().take(5)
+            maybeRefreshQuestionFeed()
+            pvpQuestions = livePvp.value.shuffled().take(5)
             if (pvpQuestions.isNotEmpty()) {
                 val q1 = pvpQuestions[0]
                 _pvpState.value = _pvpState.value.copy(
@@ -2634,12 +3329,119 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
         fiveSecondsTimerJob?.cancel()
         bedoonKalamTimerJob?.cancel()
         tabooTimerJob?.cancel()
+        roomSessionJob?.cancel()
+        realtimeRefreshJob?.cancel()
+
+        // إغلاق اتصال Realtime صراحةً: سيب WebSocket مفتوح بعد موت الـViewModel
+        // معناه خيط ونبضات شغالة لأبد الآبد واستنزاف بطارية بلا أي مستمع
+        realtimeClient.dispose()
+
+        // إيقاف سيرفر الهوتسبوت وقفل الـMulticast: onCleared بيُستدعى عند
+        // الخروج من التطبيق مش عند لفّ الشاشة، فالجلسة بتكمل طول ما التطبيق مفتوح
+        LanGameManager.shutdown()
     }
 }
 
 // -----------------------------------------------------------------------------
 // PRIVATE HELPER FUNCTIONS
 // -----------------------------------------------------------------------------
+/** عدد الصفوف المسحوبة من لوحة الصدارة السحابية. */
+private const val CLOUD_LEADERBOARD_LIMIT = 25
+
+/**
+ * فترة تحديث جلسة المباراة المباشرة (مللي ثانية) عندما لا يوجد دفع لحظي.
+ * 3 ثواني توازن بين الإحساس باللحظية واستهلاك الشبكة/البطارية.
+ */
+private const val ROOM_SESSION_POLL_MS = 3_000L
+
+/**
+ * فترة التحديث عندما يكون الاشتراك اللحظي (Realtime) شغالاً: الحلبة هنا
+ * شبكة أمان فقط، فنبطّئها لتوفير البطارية والبيانات.
+ */
+private const val ROOM_SESSION_IDLE_POLL_MS = 15_000L
+
+/**
+ * تجميع انفجارات أحداث Realtime (مللي ثانية).
+ * تحديث مشارك واحد بيسبب عدة أحداث متتالية — بندمجهم في مزامنة واحدة.
+ */
+private const val REALTIME_REFRESH_DEBOUNCE_MS = 400L
+
+/**
+ * أقل زمن بين مزامنتين لأسئلة البوت (مللي ثانية).
+ *
+ * عشر دقايق كفاية إن لاعب يفتح أكتر من لعبة ورا بعض من غير ما نرمي طلبات
+ * شبكة زيادة، وفي نفس الوقت لو البوت نشر حالاً اللاعب هيشوف الجديد في
+ * الجلسة الجاية.
+ */
+private const val QUESTION_FEED_MIN_REFRESH_MS = 10 * 60 * 1000L
+
+/**
+ * طول الجولة لكل لعبة.
+ *
+ * الأرقام دي مش اختراع: هي **عدد الأسئلة المضمّنة في APK** لكل لعبة
+ * (15 / 9 / 8)، فالجولة بتفضل بنفس الإحساس بالظبط. الفرق إن المصادر
+ * اتبدلت: قبل كده كانت «كل المحتوى اللي عندنا»، ودلوقتي «عينة عشوائية
+ * من مخزون بيكبر كل يوم».
+ *
+ * ليه لازم تكون ثابتة؟ لأن التلات ألعاب بتخلص لما القائمة تخلص
+ * (`index + 1 < questions.size`). من غير `take`، بعد أسبوع واحد من نشر
+ * البوت هتبقى الجولة ~450 سؤال — وده مكسور في حد ذاته: في «صباحو» كل
+ * سؤال ليه 25 ثانية، فجلسة 450 سؤال معناها نظرياً ساعتين اللعب.
+ * والعينة العشوائية بتضمن إن السؤال الجديد بيظهر رغم إن الجولة قصيرة.
+ */
+private const val ROUND_LENGTH_THIRTY_SECONDS = 15
+private const val ROUND_LENGTH_SABAHO = 9
+private const val ROUND_LENGTH_TRUE_FALSE = 16
+
+/**
+ * «صح/غلط» أطول شوية (16 بدل 8) لأن مفيش وقت لكل سؤال فيها، والمضمّن
+ * كان صغير جداً فالتنويع بيوصل أحسن. لو عايزها أطول: رقم واحد بيتغير هنا.
+ */
+
+/** نتائج تجريبية للوحة الصدارة عندما لا يوجد سيرفر مُهيّأ. */
+private fun demoCloudScores(): List<SupabaseScore> = listOf(
+    SupabaseScore(id = "demo_1", playerName = "عمر المدريدي 👑", points = 5420, coins = 1100, levelTitle = "أسطورة الملاعب", favoriteClub = "ريال مدريد"),
+    SupabaseScore(id = "demo_2", playerName = "ياسين الأطلسي 🇲🇦", points = 4950, coins = 980, levelTitle = "محترف دولي", favoriteClub = "الوداد البيضاوي"),
+    SupabaseScore(id = "demo_3", playerName = "أحمد الفراعنة 🇪🇬", points = 4310, coins = 820, levelTitle = "كابتن الملعب", favoriteClub = "الأهلي المصري")
+)
+
+/**
+ * غرف تجريبية تُعرض عندما لا توجد غرف حقيقية (سيرفر غير مُهيّأ أو قائمة فارغة)،
+ * حتى تبقى شاشة "غرف اللعب" حيّة وقابلة للتجربة.
+ */
+private fun demoOnlineRooms(): List<GameRoom> = listOf(
+    GameRoom(
+        roomCode = "STAD99",
+        hostName = "كابتن ساري ⚽",
+        gameType = "thirty_seconds",
+        status = com.example.data.room.RoomStatus.WAITING,
+        participantCount = 3,
+        maxPlayers = 6,
+        region = "MENA",
+        createdAtMillis = System.currentTimeMillis() - 60_000
+    ),
+    GameRoom(
+        roomCode = "BUZZ22",
+        hostName = "فارس الكالتشيو 🇮🇹",
+        gameType = "buzzer",
+        status = com.example.data.room.RoomStatus.WAITING,
+        participantCount = 2,
+        maxPlayers = 4,
+        region = "GULF",
+        createdAtMillis = System.currentTimeMillis() - 180_000
+    ),
+    GameRoom(
+        roomCode = "GRID33",
+        hostName = "البروفيسور 🧠",
+        gameType = "tictactoe",
+        status = com.example.data.room.RoomStatus.PLAYING,
+        participantCount = 2,
+        maxPlayers = 2,
+        region = "NAfrica",
+        createdAtMillis = System.currentTimeMillis() - 420_000
+    )
+)
+
 private fun generateChallengeCode(): String {
     val prefixes = listOf("CHAMP", "KICK", "TAHADDI", "MADRID", "BARCA", "CAPTAIN", "GOAL", "LEGEND")
     val num = (1000..9999).random()
