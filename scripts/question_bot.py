@@ -35,6 +35,8 @@
     QUESTION_BOT_DAILY_CAP        سقف النشر اليومي (افتراضي 250)
     LLM_MAX_BATCH               حجم دفعة التوليد (40)  LLM_TIMEOUT_SECONDS (120)
     QUESTION_BOT_DIFFICULTY       mixed | easy | medium | hard | mostly_easy ...
+    QUESTION_BOT_VERIFY           off | demote | default (تدقيق صحة الإجابة)
+    LLM_MODEL_VERIFY              موديل مراجعة مختلف = أعلى جودة ممكنة
     LLM_MAX_REQUESTS_PER_RUN      حارس حد طلبات OpenRouter المجاني (10)
 """
 
@@ -196,6 +198,33 @@ HTTP_TIMEOUT_SECONDS = int(_env("LLM_TIMEOUT_SECONDS", default="120"))
 AUTO_PUBLISH = _env("QUESTION_BOT_AUTO_PUBLISH", default="true").strip().lower() not in (
     "0", "false", "no", "off"
 )
+
+# ---------------------------------------------------------------------------
+# تدقيق صحة الإجابة — مش تدقيق الصيغة
+# ---------------------------------------------------------------------------
+# كل الفلاتر التانية (طول، عدد خيارات، تشكيل، تكرار) بتحكم على **الشكل**.
+# مافيهاش أي حاجة تعرف لو «ريال مدريد» هي الإجابة الصح فعلاً. لو مصدر
+# الأسئلة موديل، النسبة دي مش 100% — والسؤال اللي إجابته غلط بيترمي في
+# اللعبة على طول في وضع النشر التلقائي.
+#
+# الفحص ده بيسأل الموديل نفسه (أو تاني موديل بـ LLM_MODEL_VERIFY) مراجعة
+# إجاباته: بنديله السؤال + الإجابة المختارة + الشرح، ونطلب الأرقام اللي
+# متأكدين إنها غلط، والأرقام اللي مش متأكدين منها. أرخص طريقة ترفع
+# «كام سؤال صح» من غير ما نغيّر مصدر المحتوى.
+#
+#   off     → ماتفحصش (كان سلوك المشروع قبل كده)
+#   demote  → الغلط/المشبوه يتخزن pending للمراجعة، والباقي published  ← الافتراضي
+#   drop    → الغلط/المشبوه اترفض خالص، مابيدخلش القاعدة
+VERIFY_POLICY = _env("QUESTION_BOT_VERIFY", default="demote").strip().lower()
+#: هل الأسئلة «مش متأكد منها» تتعامل معاملة الغلط؟ 1 = أيوه (الأأمن للاعب).
+VERIFY_UNSURE = _env("QUESTION_BOT_VERIFY_UNSURE", default="1") not in ("0", "false", "no")
+#: عدد الأسئلة في طلب المراجعة الواحد. 20 = توازن بين طلبات أقل (العملة
+#: الحقيقية على الطبقة المجانية) وبين رد مايتقطّعش من سقف التوكنات.
+VERIFY_BATCH = int(_env("QUESTION_BOT_VERIFY_BATCH", default="20"))
+#: موديل المراجعة. لو فاضي = نفس الموديل (بيلقط أخطاء الصياغة والثقة)، ولو
+#: مختلف = مراجعة مستقلة فعلًا وده أقوى بكتير في كشف المعلومة المخترعة
+#: (نفس الموديل بيميل يوافق على إجابته). مثال: openrouter/deepseek-r1:free
+VERIFY_MODEL = _env("LLM_MODEL_VERIFY")
 
 #: أقصى عدد أسئلة ينشره البوت في اليوم — الحد اللي طلبته (250/يوم).
 #: الحماية دي لوحدها اللي بتمنع يوم يسبّب فيه الموديل هلوسة جماعية تفخّ الجدول.
@@ -1137,6 +1166,213 @@ def _extract_chat_text(body: Any) -> str:
     return ""
 
 
+VERIFY_SYSTEM_PROMPT = """أنت مدقّق أسئلة رياضية عربية. هاستلملك أسئلة وكل سؤال معه الإجابة المختارة وشرحها.
+مهمتك تحكّم على **صحة المعلومة** بس — ماتبصش على الصيغة أو الترقيم.
+
+- لو الإجابة المختارة **غلط** (أو الشرح بيخالف الواقع): حط رقم السؤال في `wrong` واكتب السبب في `why`.
+- لو مش متأكد 100% إنها صح (معلومة دقيقة، رقم سنة، لقب، إحصاء): حطه في `unsure`.
+- لو متأكد إنها صح: ماتحطوش في أي حاجة.
+- ماتخترعش أخطاء: سؤال صحيح في نظر المعرفة العامة العامة يتسابب من غير علامة.
+
+ارجع JSON فقط:
+{"wrong":[{"index":0,"why":"الفريق الفلاني هو اللي فاز"}], "unsure":[{"index":3,"why":"السنة محتاجة مصدر"}]}
+`index` رقم السؤال زي ما اتبعتلك إياه (يبدأ من 0)."""
+
+
+def build_verify_prompt(rows: Sequence[Dict[str, Any]]) -> str:
+    """
+    نص طلب المراجعة.
+
+    مابعّطش الإجابة الصحيحة بصيغة «الإجابة: صح» عشان الموديل ما ينسوقش
+    يوافق مع نفسه؛ بنعرض السؤال والخيارات كلها والإشارة للاختيار المختار
+    بموضعه بس، فاضطره يعيد حل السؤال من الأول.
+    """
+    nl = chr(10)
+    lines_out: List[str] = []
+    for i, row in enumerate(rows):
+        options = row.get("options") or []
+        gt = str(row.get("game_type") or "")
+        if gt == "true_false":
+            verdict = "صح" if int(row.get("correct_index") or 0) == 0 else "غلط"
+            lines_out.append(f"[{i}] (صح/غلط) {row['question']}")
+            lines_out.append(f"    الإجابة المعتمدة: {verdict}")
+        else:
+            picked = "(غير محددة)"
+            try:
+                picked = str(options[int(row.get("correct_index") or 0)])
+            except (IndexError, TypeError, ValueError):
+                pass
+            opts = " | ".join(str(o) for o in options)
+            lines_out.append(f"[{i}] {row['question']}")
+            lines_out.append(f"    الخيارات: {opts}")
+            lines_out.append(f"    المختار: {picked}")
+        explanation = str(row.get("explanation") or "").strip()
+        if explanation:
+            lines_out.append(f"    الشرح: {explanation}")
+    head = "راجع الأسئلة دي (" + str(len(rows)) + " سؤال):"
+    return head + nl + nl.join(lines_out)
+
+
+def parse_verification_json(text: str) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """
+    `{"wrong":[...],"unsure":[...]}` ← (خريطة الغلط, خريطة المشكوك فيه).
+
+    ملاحظة عملية: مابنعتمدش على parse_questions_json هنا — الدالة دي بترمي
+    Rejected على أي رد مافيهوش مفتاح `questions`، ورد المراجعة مافيهوش
+    المفتاح ده بطبيعته. فبنشيل الـfences ourselves وبنقرا JSON مباشرةً.
+
+    بنرجّع قواميط مش قايمتين لأن الموديل بيرجع نفس الـindex أكتر من مرة في
+    الدفعات الكبيرة، وبنفضّل أول سبب على أي تاني.
+    """
+    wrong: Dict[int, str] = {}
+    unsure: Dict[int, str] = {}
+    if not text:
+        return wrong, unsure
+
+    cleaned = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+    if not cleaned.startswith("{"):
+        cut = cleaned.find("{")
+        if cut < 0:
+            return wrong, unsure
+        cleaned = cleaned[cut:]
+
+    try:
+        payload: Any = json.loads(cleaned)
+    except json.JSONDecodeError:
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            return wrong, unsure
+    if isinstance(payload, list):
+        payload = next((x for x in payload if isinstance(x, dict)), None)
+    if not isinstance(payload, dict):
+        return wrong, unsure
+
+    for key, target in (("wrong", wrong), ("unsure", unsure)):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                idx_raw = item.get("index", item.get("i", item.get("q")))
+                reason = str(item.get("why") or item.get("reason") or "").strip()
+            elif isinstance(item, (int, str)):
+                idx_raw, reason = item, ""
+            else:
+                continue
+            try:
+                idx = int(idx_raw)
+            except (TypeError, ValueError):
+                continue
+            if idx < 0:
+                continue
+            target.setdefault(idx, reason or "بدون سبب")
+    return wrong, unsure
+
+
+def verify_answers(
+    rows: List[Dict[str, Any]], log: List[str]
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    يفصل الأسئلة المؤكدة عن الغلط/المشبوه. بيرجع (الآمنة، عدد الغلط، عدد المشبوه).
+
+    السياسة:
+      - `off` أو مافيش مزوّد ⇒ بيمرّر كل حاجة زي ما هي (مافيش تغيير سلوك).
+      - الميزانية خلصت ⇒ بيمرّر وبيسجّل، لأنه الأأمن إن النشر يكمل بأفضل
+        معرفة ممكنة من إن الطلبات المتبقية تتحرق على الفحص.
+      - الفحص نفسه فشل ⇒ بيمرّر برضو: «مابعرفناش نتحقق» مش دليل على إن السؤال
+        غلط، ورفض محتوى سليم بسبب عطل شبكة هيبوظ المنتج أكتر.
+    """
+    if VERIFY_POLICY == "off" or not rows or resolve_provider() == "none":
+        return rows, 0, 0
+
+    safe: List[Dict[str, Any]] = []
+    wrong_count = unsure_count = 0
+    for start in range(0, len(rows), VERIFY_BATCH):
+        chunk = rows[start:start + VERIFY_BATCH]
+        if not LLM_BUDGET.acquire():
+            log.append(f"  ⏭️ تخطّينا مراجعة {len(rows) - start} سؤال: ميزانية الطلبات خلصت")
+            safe.extend(chunk)
+            break
+        try:
+            text = ask_llm_text(VERIFY_SYSTEM_PROMPT, build_verify_prompt(chunk))
+        except (RuntimeError, Rejected) as error:
+            log.append(f"  ⚠️ فشل تدقيق الإجابات ({error}) — بنمرّر الدفعة من غير فحص")
+            safe.extend(chunk)
+            continue
+
+        wrong, unsure = parse_verification_json(text)
+        flags: Dict[int, str] = dict(unsure) if VERIFY_UNSURE else {}
+        flags.update(wrong)          # الغلط أخطر ⇒ يدهس المشبوه لو الاتنين
+
+        for i, row in enumerate(chunk):
+            reason = flags.get(i)
+            if reason is None:
+                safe.append(row)
+                continue
+            if i in wrong:
+                wrong_count += 1
+                tag = "غلط"
+            else:
+                unsure_count += 1
+                tag = "مشكوك فيه"
+            if VERIFY_POLICY == "drop":
+                log.append(f"  ❌ رفض ({tag}): {row['question'][:50]} — {reason[:80]}")
+                continue
+            row["__status"] = "pending"
+            row["__note"] = f"{tag} بتدقيق آلي: {reason[:200]}"
+            log.append(f"  📝 pending ({tag}): {row['question'][:50]} — {reason[:70]}")
+            safe.append(row)
+    return safe, wrong_count, unsure_count
+
+
+def ask_llm_text(system_prompt: str, user_prompt: str) -> str:
+    """
+    استدعاء خام (نص دخول ← نص خروج) لكل المزوّدين.
+
+    بنحتاجه منفصل لأن المراجعة مش بتاعة «قايمة أسئلة»: لو بنجبرها تمرّ
+    بـ generate_questions هتتفسر غلط، والـparser بتاع الأسئلة بيرمي Rejected
+    على أي رد مافيهوش مفتاح questions.
+    """
+    provider = resolve_provider()
+    if provider == "none":
+        raise RuntimeError("مفيش مفتاح LLM — مافيش تدقيق إجابات")
+
+    if provider == "gemini":
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": 0.15, "maxOutputTokens": 4096},
+        }
+        url = GEMINI_ENDPOINT.format(model=GEMINI_MODEL)
+        body = http_json("POST", url, payload=payload,
+                         headers={"x-goog-api-key": GEMINI_API_KEY}, retries=2)
+        return _extract_gemini_text(body)
+
+    base = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
+    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+    payload = {
+        "model": VERIFY_MODEL or LLM_MODEL,
+        # المراجعة مش إبداع: درجة منخفضة بتخلي الحكم على الحقيقة لا على الأسلوب
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if LLM_ACCEPTS_MAX_TOKENS is not False:
+        payload["max_tokens"] = 4096
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    if "openrouter.ai" in url:
+        headers["HTTP-Referer"] = "https://github.com/hamama44/-"
+        headers["X-Title"] = LLM_APP_TITLE + " (verifier)"
+    body = _post_chat_with_token_fallback(url, payload, headers)
+    return _extract_chat_text(body)
+
+
 def generate_questions(
     game_type: str, count: int, existing_samples: Sequence[str]
 ) -> List[Dict[str, Any]]:
@@ -1243,9 +1479,12 @@ def publish(rows: Sequence[Dict[str, Any]], dry_run: bool) -> Dict[str, int]:
             "explanation": row["explanation"],
             "content_hash": row["content_hash"],
             "source": row["source"],
+            "review_note": row.get("__note"),
             # النشر التلقائي زي ما اخترت؛ لو القفل اتقفل السؤال يفضل pending
             # في القاعدة للتراجع، من غير ما يوصل أي لاعب.
-            "status": "published" if AUTO_PUBLISH else "pending",
+            # و__status بتاعة تدقيق الإجابات بتدهس ده: سؤال مشبوه مابيطلعش
+            # للاعيب حتى لو الباب كله مفتوح.
+            "status": str(row.get("__status") or ("published" if AUTO_PUBLISH else "pending")),
         })
 
     if dry_run:
@@ -1567,14 +1806,33 @@ def run(
             f"{rejected} مرفوض"
         )
 
-    if total_accepted:
-        stats = publish(total_accepted, dry_run=dry_run)
+    # ------------------------------------------------------------------
+    # تدقيق صحة الإجابات — بعد إزالة التكرار، عشان مانفحصش سؤال مش هينشر
+    # ------------------------------------------------------------------
+    publishable = total_accepted
+    demoted = wrong_total = unsure_total = 0
+    if total_accepted and VERIFY_POLICY != "off":
+        publishable, wrong_total, unsure_total = verify_answers(total_accepted, log)
+        demoted = sum(1 for row in publishable if row.get("__status") == "pending")
+        dropped = len(total_accepted) - len(publishable)
+        print(
+            f"   🔎 تدقيق الإجابات (سياسة {VERIFY_POLICY}"
+            + (f" بموديل {VERIFY_MODEL}" if VERIFY_MODEL else "")
+            + f"): {len(publishable) - demoted} نظيفة | {wrong_total} غلط | "
+            f"{unsure_total} مشكوك فيه | {demoted} → pending | {dropped} اترفدت"
+        )
+
+    if publishable:
+        stats = publish(publishable, dry_run=dry_run)
     else:
         stats = {"inserted": 0, "skipped": 0, "failed": 0}
 
     print("\n" + "=" * 68)
-    print(f"✅ أُنشر/يُنشر: {stats['inserted']} | تجاهل مكرر: {stats['skipped']} | "
-          f"رفض التدقيق: {total_rejected} | فشل: {stats['failed']}")
+    live = stats["inserted"] - demoted if stats["inserted"] else 0
+    print(f"✅ أُنشر/يُنشر: {stats['inserted']} (منها {live} هيوصل اللاعب دلوقتي) | "
+          f"تجاهل مكرر: {stats['skipped']} | رفض التدقيق: {total_rejected} | فشل: {stats['failed']}")
+    if demoted:
+        print(f"   📝 {demoted} سؤال مستنى مراجعة يدوية في Supabase (status=pending)")
     if log:
         print("-" * 68)
         for line in log[:40]:
@@ -1865,6 +2123,34 @@ def self_test() -> int:
     check("خطة الصعوبة بقت متوازنة على الدفعة الكبيرة",
           len(plan_big) == LLM_MAX_BATCH and len(set(plan_big)) >= 2)
 
+    # --- محلّل نتيجة تدقيق الإجابات ---
+    w, u = parse_verification_json('{"wrong":[{"index":1,"why":"الفريق غلط"}],"unsure":[{"index":3,"why":"سنة مشكوك فيها"}]}')
+    check("bيقرا wrong و unsure", w == {1: "الفريق غلط"} and u == {3: "سنة مشكوك فيها"})
+    w2, u2 = parse_verification_json('```json\n{"wrong":[{"index":0}]}\n```')
+    check("بيتعامل مع الـfence", w2 == {0: "بدون سبب"})
+    w3, u3 = parse_verification_json('{"wrong":[2, "4"]}')
+    check("بيرقّم الأرقام المجرّدة", w3 == {2: "بدون سبب", 4: "بدون سبب"})
+    w4, u4 = parse_verification_json("الأسئلة كلها سليمة ✅")
+    check("رد مافيهوش JSON → فاضي مش انفجار", w4 == {} and u4 == {})
+    w5, u5 = parse_verification_json('{"wrong":[{"index":-1},{"index":9}]}')
+    check("الرقم السالب بيتتجاهل (9 مسموح: الدفعة بتتفحص بره))", -1 not in w5)
+    w6, u6 = parse_verification_json('{"wrong":[{"index":1,"why":"أ"},{"index":1,"why":"ب"}]}')
+    check("تكرار نفس الـindex بياخد الأول", w6 == {1: "أ"})
+
+    # نص طلب المراجعة لازم يفضّل الإجابة
+    vp = build_verify_prompt([{
+        "game_type": "thirty_seconds", "question": "مين كسب 2022؟",
+        "options": ["الأرجنتين", "فرنسا"], "correct_index": 0, "explanation": "بركلات الترجيح"
+    }])
+    check("بيعرض الخيارات والمختار", "الخيارات:" in vp and "المختار: الأرجنتين" in vp)
+    check("مابيكتبش 'الإجابة الصحيحة' (مانسوقش الموديل)", "الإجابة الصحيحة" not in vp)
+    vptf = build_verify_prompt([{"game_type": "true_false", "question": "كل 4 سنين؟",
+                                 "options": [], "correct_index": 1, "explanation": ""}])
+    check("true_false بتترجم لـغلط مش رقم", "المعتمدة: غلط" in vptf)
+    vpidx = build_verify_prompt([{"game_type": "pvp", "question": "س", "options": [],
+                                 "correct_index": 5, "explanation": ""}])
+    check("فهرس خارج الحدود مابيكسرش", "غير محددة" in vpidx)
+
     print("✅ كل الاختبارات المدمجة عدّت")
     return 0
 
@@ -1886,6 +2172,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--model", default=None, help="اسم الموديل (بيدهس OPENROUTER_MODEL/GEMINI_MODEL)")
     parser.add_argument("--base-url", default=None, help="base URL للـchat completions")
     parser.add_argument("--api-key", default=None, help="مفتاح الـAPI للمزوّد المفتوح")
+    parser.add_argument("--verify", choices=("off", "demote", "drop"), default=None,
+                        help="تدقيق صحة الإجابة: off=بدون، demote=المشبوه pending، drop=يترفض")
+    parser.add_argument("--verify-model", default=None, help="موديل المراجعة (أقوى لما يكون مختلف)")
     parser.add_argument("--difficulty", default=None,
                         help="mixed | easy | medium | hard | mostly_easy | mostly_hard | medium_hard | easy=1,medium=2,hard=1")
     parser.add_argument("--curated", default=os.path.join(os.path.dirname(__file__), "questions_curated.json"))
@@ -1913,6 +2202,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         OPENROUTER_BASE_URL = args.base_url
     if args.api_key:
         LLM_API_KEY = args.api_key
+    if args.verify:
+        globals()["VERIFY_POLICY"] = args.verify
+    if args.verify_model:
+        globals()["VERIFY_MODEL"] = args.verify_model
     if args.difficulty:
         DIFFICULTY_POLICY_RAW = args.difficulty.strip().lower()
         DIFFICULTY_WEIGHTS = parse_difficulty_policy(DIFFICULTY_POLICY_RAW)
