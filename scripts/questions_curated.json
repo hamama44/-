@@ -1,0 +1,63 @@
+{
+  "questions": [
+    {
+      "game_type": "thirty_seconds",
+      "question": "أنهي منتخب كسب كوبا أمريكا 2021؟",
+      "options": [
+        "الأرجنتين",
+        "البرازيل",
+        "تشيلي",
+        "أوروجواي"
+      ],
+      "correct_index": 0,
+      "difficulty": "medium",
+      "category": "منتخبات",
+      "explanation": "الأرجنتين كسبت اللقب على حساب البرازيل في النهائي."
+    },
+    {
+      "game_type": "true_false",
+      "question": "مباراة كرة القدم بتتلهى شوطين كل واحد 45 دقيقة.",
+      "is_true": true,
+      "difficulty": "easy",
+      "category": "قوانين",
+      "explanation": "45 دقيقة لكل شوط زيادة وقت محتسب."
+    },
+    {
+      "game_type": "pvp",
+      "question": "مين كسب الكرة الذهبية سنة 2008؟",
+      "options": [
+        "كريستيانو رونالدو",
+        "ليونيل ميسي",
+        "كاكا",
+        "لوكا مودريتش"
+      ],
+      "correct_index": 0,
+      "difficulty": "hard",
+      "category": "جوائز",
+      "explanation": "كريستيانو رونالدو أول كورة ذهبية له كانت 2008."
+    },
+    {
+      "game_type": "sabaho",
+      "question": "أنهي نادٍ إنجليزي لعبوا له كل من رونالدو وصلاح وجوميز؟",
+      "options": [
+        "ليفربول",
+        "مانشستر يونايتد",
+        "تشيلسي",
+        "مانشستر سيتي"
+      ],
+      "correct_index": 1,
+      "difficulty": "hard",
+      "category": "أندية",
+      "explanation": "التلاتة لعبوا لمانشستر يونايتد."
+    },
+    {
+      "game_type": "thirty_seconds",
+      "question": "قصير",
+      "options": [
+        "ا",
+        "ب"
+      ],
+      "correct_index": 0
+    }
+  ]
+}

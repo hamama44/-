@@ -1,0 +1,255 @@
+name: Question Bot (إضافة أسئلة تلقائياً)
+
+# ===========================================================================
+# بيشتغل إمتى؟
+#   - كل 6 ساعات، أو يدوياً من تبويب Actions (Run workflow) مع تغيير العدد
+#
+# البوت بيولّد أسئلة (OpenRouter أو Gemini) أو بياخد من ملف curated، بيدقّقها،
+# بيمنع التكرار، وبينشرها في جدول public/questions. التطبيق بيقرأ من الجدول
+# تلقائياً ⇒ مفيش حاجة تتعمل في المتجر كل مرة، وده المقصود بـ«دايماً متحدّثة».
+#
+# ===========================================================================
+# الإعداد مرة واحدة: GitHub → Settings → Secrets and variables → Actions
+#
+#   ┌─ Secrets (مفاتيح سرية) ──────────────────────────────────────────────
+#   │ SUPABASE_URL               https://xyzcompany.supabase.co
+#   │ SUPABASE_SERVICE_ROLE_KEY  مفتاح service_role — بيسمح بالكتابة وبيتجاوز RLS.
+#   │                            ⚠️ أقوى مفتاح في المشروع: في Secrets بس،
+#   │                            مش في الـrepo ومش في الـAPK.
+#   │ OPENROUTER_API_KEY         مفتاح OpenRouter (المسار المفضّل الآن)
+#   │ GEMINI_API_KEY             اختياري — بديل مباشر لو عايز Google الأصلي
+#   └──────────────────────────────────────────────────────────────────────
+#   ┌─ Variables (مش سرية — تتغيّر من الواجهة بدون edit للملف) ────────────
+#   │ LLM_MODEL                  google/gemini-2.5-flash-exp:free   (افتراضي)
+#   │ LLM_BASE_URL               https://openrouter.ai/api/v1       (اختياري)
+#   │ LLM_PROVIDER               auto | openrouter | gemini          (اختياري)
+#   │ QUESTION_BOT_DIFFICULTY    mixed | easy | medium | hard |
+#   │                            mostly_easy | mostly_hard | medium_hard
+#   │ QUESTION_BOT_DAILY_CAP     250
+#   │ QUESTION_BOT_AUTO_PUBLISH  true (=false → pending للمراجعة)
+#   └──────────────────────────────────────────────────────────────────────
+#
+# ومطلوب مرة واحدة كمان: نفّذ supabase_schema_v3.sql في Supabase SQL Editor.
+#
+# ===========================================================================
+# 250 سؤال/يوم — الأرقام اللي مشتغلة على بعضها (GitHub Free = 2000 دقيقة/شهر)
+#
+#   التوزيع: 18 سؤال/نوع × 4 أنواع × 4 تشغيلات = **288** مرشّح، والسقف 250
+#   بيوقف الزيادة لوحده (الميزانية بتتقسم على الأنواع، فالآخر بييجي 250 بالظبط).
+#
+#   الطلبات — دي العملة الحقيقية على الطبقة المجانية (50 طلب/يوم، 20/دقيقة).
+#   مقسوس على سيرفر mock بيطابق شكل OpenRouter، بالتشغيل الكامل (4 أنواع):
+#     بدون تدقيق إجابات: 4 طلبات  ⇒ 16/يوم
+#     مع تدقيق الإجابات: **8 طلبات** (4 توليد + 3-4 مراجعة) ⇒ **24-32/يوم**
+#     ⇒ لسه تحت الـ50، والمراجعة مابقتش ترف — بتاخد تلت الميزانية بس.
+#   في الواقع الرفض بيطلع 20-45% ⇒ 2-3 محاولات/نوع ⇒ 10-14 طلب/تشغيل.
+#   ⚠️ عشان كده الحارس 14 والجدول 3 تشغيلات (3×14=42 < 50). متزوّدش
+#   عدد التشغيلات من غير ما تنزّل LLM_MAX_REQUESTS_PER_RUN.
+#
+#   الدقايق: 4-14 طلب × 20-35 ثانية + نشر متقطّع (chunk=25) ⇒ **~4-5 د/تشغيل**.
+#     90 تشغيل/شهر (3/يوم) × 4.5 د = **~405 دقيقة/شهر = 20% من الـ2000** ✅
+#     ولو الريبو Public: دقايق Linux runners بلا حد أصلاً.
+#     ولو الريبو Public: دقايق Linux runners أصلاً بلا حد.
+#
+#   القاعدة: 250 × 30 = 7500 صف/شهر ≈ 4MB ⇒ مafeh problem في Supabase Free (500MB
+#     = ~3 سنين شغل). فحص التكرار بقى بيقرا البصمات كلها + 800 نص حديث، فمش
+#     هينفخ اللوج ولا هيفوّت مكررات قديمة لما الجدول يكبر.
+#   التطبيق: بيقرا 90 سؤال/نوع في المزامنة (أكتر من يوم نشر كامل) ⇒ اللاعب
+#     بيشوف الجديد فعلًا مش بس الجدول.
+#
+#   ⚠️ اللي السقف العالي بيغيّره: التدقيق بيمسك **الصيغة** مش **صحة المعلومة**.
+#     مع 250/يوم من غير مراجعة هتدخل إجابات غلط. لو ده مقلّقك:
+#     vars → QUESTION_BOT_AUTO_PUBLISH=false فتتخزن pending، وتراجعها في
+#     Supabase Studio وتوافق عليها دفعة واحدة (اللاعب ما بيقراش غير published).
+# ===========================================================================
+
+on:
+  schedule:
+    # 3 تشغيلات في اليوم (كل 8 ساعات). ليه مش 4؟ لأن تدقيق الإجابات بيستهلك
+    # طلبات بنفس قدر التوليد، و 4 × 14 = 56 > حد OpenRouter المجاني (50/يوم).
+    # 3 × 14 = 42 ⇒ الباب مفتوح للمراجعة من غير ما نقفل على الحد.
+    - cron: "0 0,8,16 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "أقصى عدد أسئلة لكل نوع في التشغيل (21 × 4 أنواع × 3 تشغيلات = 252، والسقف 250 يقطع الزيادة)"
+        required: false
+        default: "21"
+        type: string
+      dry_run:
+        description: "طباعة النتيجة من غير نشر (true/false)"
+        required: false
+        default: "false"
+        type: string
+      source:
+        description: "المصدر: both / openrouter / gemini / curated"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - openrouter
+          - gemini
+          - curated
+      model:
+        description: "اسم الموديل (فاضي = LLM_MODEL أو الافتراضي المجاني)"
+        required: false
+        default: ""
+        type: string
+      difficulty:
+        description: "الصعوبة: فاضي=mixed، أو easy / medium / hard / mostly_hard / medium_hard"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - mixed
+          - easy
+          - medium
+          - hard
+          - mostly_easy
+          - mostly_hard
+          - medium_hard
+
+# تشغيل واحد في نفس اللحظة: لو تشغيلين تولّدوا في نفس الوقت، اليونيكون هيمسك
+# التكرار بس ده رمي شبكة بلا فايدة. الأهدأ إننا ما نبدأش أصلاً.
+concurrency:
+  group: question-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  add-questions:
+    name: توليد ونشر الأسئلة
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      # --- مزوّد التوليد: OpenRouter (موصى به) أو Gemini مباشرةً ---
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENROUTER_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      OPENROUTER_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+
+      # --- سياسة المحتوى ---
+      # السقف اليومي في البوت نفسه، فحتى لو الـcron اتشغّل زيادة مايفخّش الجدول
+      QUESTION_BOT_DAILY_CAP: ${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}
+      # ⚠️ صمّام الأمان: false ⇒ الأسئلة تتخزن pending فتفضل مخزّنة ومابتوصلش
+      # اللاعب (الـview والتطبيق بيقرا published بس). مع 250/يوم من غير مراجعة
+      # ده الخيار اللي بيحمي اللعبة من معلومة مخترعة؛ الافتراضي true احتراماً
+      # لاختيارك «نشر تلقائي + سقف».
+      QUESTION_BOT_AUTO_PUBLISH: ${{ vars.QUESTION_BOT_AUTO_PUBLISH || 'true' }}
+      QUESTION_BOT_DIFFICULTY: ${{ vars.QUESTION_BOT_DIFFICULTY }}
+      # حارس حد الطلبات المجاني (50/يوم): 4 تشغيلات × 12 = 48 < 50.
+      # ⚠️ لو زوّت عدد التشغيلات في اليوم لازم تنزّل الرقم ده.
+      LLM_MAX_REQUESTS_PER_RUN: ${{ vars.LLM_MAX_REQUESTS_PER_RUN || '14' }}
+      # حجم دفعة التوليد: طلب واحد بيرجع ~22 مرشح، فـ250 سؤال/يوم بياخد
+      # ~32 طلب/يوم. لو نزّلته لـ20 (القديم) هتحتاج ضعف الطلبات وتضرب الحد.
+      LLM_MAX_BATCH: ${{ vars.LLM_MAX_BATCH || '40' }}
+      LLM_MAX_TOKENS: ${{ vars.LLM_MAX_TOKENS || '20000' }}
+      LLM_TIMEOUT_SECONDS: ${{ vars.LLM_TIMEOUT_SECONDS || '120' }}
+      LLM_MAX_ATTEMPTS: ${{ vars.LLM_MAX_ATTEMPTS || '8' }}
+
+      # --- تدقيق صحة الإجابة ---
+      # demote = الغلط/المشبوه يتخزن pending (مالاعيب بيشوفش غير النضيف)
+      # off    = ماتفحصش  |  drop = المشبوه يترفض من غير ما يتخزن
+      QUESTION_BOT_VERIFY: ${{ vars.QUESTION_BOT_VERIFY || 'demote' }}
+      # ⚠️ أهم سطر في الجودة: موديل مراجعة **مختلف** عن الموديل اللي ولّد.
+      # نفس الموديل بيراجع نفسه بيقع في نفس نقطة العمى (blind spot)، فالموديل
+      # التاني هو اللي بيرفع نسبة «كام سؤال إجابته صح» فعلًا.
+      LLM_MODEL_VERIFY: ${{ vars.LLM_MODEL_VERIFY }}
+
+    steps:
+      - name: سحب الكود
+        uses: actions/checkout@v4
+
+      - name: تجهيز Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # لو منطق التدقيق مكسور، الأأمن نوقف قبل أي كتابة: النشر تلقائي،
+      # فاللي هيوصل القاعدة هيوصل للاعيبين على طول.
+      - name: اختبار منطق التدقيق
+        run: python3 scripts/question_bot.py --self-test
+
+      - name: فحص الإعدادات
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::ناقص SUPABASE_URL أو SUPABASE_SERVICE_ROLE_KEY في Secrets"
+            exit 1
+          fi
+          if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$GEMINI_API_KEY" ]; then
+            echo "::warning::مفيش OPENROUTER_API_KEY ولا GEMINI_API_KEY — هيتم نشر ملف curated فقط"
+          elif [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "✅ التوليد على OpenRouter بالموديل: ${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}"
+            case "${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}" in
+              *:free) echo "ℹ️ موديل مجاني — حد OpenRouter 50 طلب/يوم و20/دقيقة" ;;
+              *)      echo "ℹ️ موديل مدفوع — هيتحاسب من رصيدك على عدد التوكنات" ;;
+            esac
+          else
+            echo "✅ التوليد على Gemini بالموديل: ${GEMINI_MODEL:-gemini-2.5-flash}"
+          fi
+
+      - name: تشغيل البوت
+        # المدخلات بتدخل عبر env مش داخل سطر الـcommand: كده نص المستخدم
+        # (مثلاً اسم موديل فيه فاصلة أو علامة اقتباس) ما يتفسرش كأمر shell،
+        # وبنستغني عن eval خالص.
+        env:
+          IN_LIMIT: ${{ github.event.inputs.limit || '6' }}
+          IN_SOURCE: ${{ github.event.inputs.source || 'both' }}
+          IN_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          IN_MODEL: ${{ github.event.inputs.model }}
+          IN_DIFFICULTY: ${{ github.event.inputs.difficulty }}
+        run: |
+          ARGS=(--limit "$IN_LIMIT" --source "$IN_SOURCE")
+          if [ "$IN_DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          # المدخلات اليدوية بتدهس قيم الـvars، وده المقصود: «Run workflow»
+          # هو مكان التجربة السريعة قبل ما نغيّر الإعداد الدائم.
+          if [ -n "$IN_MODEL" ]; then ARGS+=(--model "$IN_MODEL"); fi
+          if [ -n "$IN_DIFFICULTY" ]; then ARGS+=(--difficulty "$IN_DIFFICULTY"); fi
+          if [ "$IN_SOURCE" = "openrouter" ]; then ARGS+=(--provider openrouter); fi
+          if [ "$IN_SOURCE" = "gemini" ]; then ARGS+=(--provider gemini); fi
+          # الفشل الجزئي (بعض الدفعات اترفضت) مش كارثة، لكن الفشل الكامل
+          # (كود 2: اتصال/إعدادات) لازم يبيّن الـworkflow أحمر عشان ننتبه.
+          set +e
+          python3 scripts/question_bot.py "${ARGS[@]}"
+          CODE=$?
+          set -e
+          echo "BOT_EXIT_CODE=$CODE" >> "$GITHUB_ENV"
+          if [ "$CODE" = "2" ]; then
+            echo "::error::البوت فشل بالكامل (اتصال/إعدادات) — راجع اللوج"
+            exit 2
+          fi
+
+      - name: ملخّص التشغيل
+        if: always()
+        run: |
+          {
+            echo "## 🤖 حالة البوت"
+            echo ""
+            echo "- كود الخروج: \`${BOT_EXIT_CODE:-?}\`"
+            echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
+            echo "- الموديل: \`${{ github.event.inputs.model || vars.LLM_MODEL || 'google/gemini-2.5-flash-exp:free' }}\`"
+            echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mixed (سهل/متوسط/صعب بالتناوب)' }}\`"
+            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '12' }}\` · دفعة التوليد: \`${{ vars.LLM_MAX_BATCH || '40' }}\`"
+            if [ "${{ vars.QUESTION_BOT_AUTO_PUBLISH }}" = "false" ]; then
+              echo "- وضع النشر: **pending للمراجعة** — مabiوصلش اللاعب لحد ما توافق 📝"
+            else
+              echo "- وضع النشر: تلقائي للاعيبين 🚀"
+            fi
+            echo ""
+            if [ -n "$OPENROUTER_API_KEY" ]; then
+              echo "- التوليد: OpenRouter ✅"
+            elif [ -n "$GEMINI_API_KEY" ]; then
+              echo "- التوليد: Gemini ✅"
+            else
+              echo "- التوليد: معطّل — curated فقط ⚠️"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
