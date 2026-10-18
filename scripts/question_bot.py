@@ -35,7 +35,7 @@
     محتوى الأسئلة:
     QUESTION_BOT_DAILY_CAP        سقف النشر اليومي (افتراضي 250)
     LLM_MAX_BATCH               حجم دفعة التوليد (40)  LLM_TIMEOUT_SECONDS (120)
-    QUESTION_BOT_DIFFICULTY       mixed | easy | medium | hard | mostly_easy ...
+    QUESTION_BOT_DIFFICULTY       mostly_hard (افتراضي) | mixed | easy | medium | hard | mostly_easy | medium_hard
     QUESTION_BOT_VERIFY           off | demote | default (تدقيق صحة الإجابة)
     LLM_MODEL_VERIFY              موديل مراجعة مختلف = أعلى جودة ممكنة
     LLM_MAX_REQUESTS_PER_RUN      حارس حد طلبات OpenRouter المجاني (10)
@@ -809,14 +809,17 @@ def count_published_last_24h(game_type: Optional[str] = None) -> int:
 # تدرّج عشان «30 ثانية» و«صباحو» ليهم صعوبة مختلفة في اللعب.
 #
 # الصيغ المقبولة في QUESTION_BOT_DIFFICULTY:
-#   mixed          → توزيع متوازن easy/medium/hard (الافتراضي)
+#   mostly_hard    → 50% صعب / 35% متوسط / 15% سهل (الافتراضي)
+#   mixed          → توزيع متوازن easy/medium/hard
 #   easy|medium|hard → كل الدفعة على مستوى واحد (بيُجبَر حرفياً)
 #   mostly_easy    → 50% سهل / 35% متوسط / 15% صعب
-#   mostly_hard    → 50% صعب / 35% متوسط / 15% سهل
 #   medium_hard    → نصين، من غير أسئلة سهلة
 #   easy=1,medium=2,hard=1 → أوزان صريحة
 
-DIFFICULTY_POLICY_RAW = _env("QUESTION_BOT_DIFFICULTY", default="mixed").strip().lower()
+DEFAULT_DIFFICULTY_POLICY = "mostly_hard"
+DIFFICULTY_POLICY_RAW = _env(
+    "QUESTION_BOT_DIFFICULTY", default=DEFAULT_DIFFICULTY_POLICY
+).strip().lower()
 
 _DIFFICULTY_PRESETS: Dict[str, Dict[str, int]] = {
     "mixed": {"easy": 1, "medium": 1, "hard": 1},
@@ -960,7 +963,19 @@ LLM_BUDGET = RequestBudget(LLM_MAX_REQUESTS_PER_RUN)
 # توليد بـ Gemini
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """أنت مولّد أسئلة لعبة كروية عربية. مهمتك: أسئلة قصيرة، معلومتها صحيحة وموثوقة، وصياغة مصرية/فصحى مبسطة يفهمها شاب عربي.
+SYSTEM_PROMPT = """أنت مولّد أسئلة لعبة كروية عربية لجمهور يعرف كرة القدم. مهمتك كتابة أسئلة قصيرة، دقيقة، ومبنية على حقائق موثوقة، بصياغة مصرية/عربية مبسطة وواضحة.
+
+مستويات الصعوبة — صنّف السؤال حسب المعرفة المطلوبة فعلًا، لا حسب طول الصياغة:
+- easy: معلومة أساسية لكنها ليست بديهية جدًا.
+- medium: معلومة تاريخية أو كروية معروفة تحتاج بعض التذكّر أو الربط.
+- hard: سؤال لمحترف يختبر تفصيلًا دقيقًا وثابتًا، لا معلومة عامة. فضّل أرقامًا وسنوات محددة، نتائج نهائيات وبطولات، أعداد أهداف هداف في بطولة/نسخة محددة، ألقابًا حتى نهاية موسم أو سنة محددة، لاعبين أو تشكيلات نهائيات بعينها، تفاصيل دقيقة من قوانين اللعبة، وسعات ملاعب موثقة لفترة أو مصدر محدد.
+- لا تصنّف سؤالًا عامًا على أنه hard لمجرد صياغته بطريقة ملتوية، ولا تخفّض سؤالًا دقيقًا إلى easy. اتبع توزيع الصعوبة المطلوب في طلب المستخدم.
+
+معيار الجودة والدقة:
+- المطلوب تفاصيل دقيقة لا أسئلة معلومات عامة سهلة. ممنوع الأسئلة البديهية مثل «كم عدد لاعبي الفريق؟» أو «ما لون كارت الطرد؟».
+- حدّد البطولة/الموسم/السنة عند السؤال عن رقم أو إنجاز حتى لا يكون السؤال ملتبسًا أو متغيرًا بمرور الوقت.
+- لا تخمّن أي رقم أو تشكيلة أو سنة. استخدم فقط حقائق تاريخية مستقرة وواثقًا من صحتها؛ إذا لم تكن متأكدًا، استبدل السؤال بحقيقة موثوقة أخرى.
+- اجعل لكل سؤال إجابة واحدة واضحة، وخيارات الإجابة الخاطئة معقولة لكن غير ملتبسة. اكتب شرحًا قصيرًا يذكر الحقيقة الدقيقة التي تثبت الإجابة.
 
 ممنوع منعاً باتاً:
 - أي معلومة تتغير مع الوقت (أسعار انتقال، ترتيب جدول حالي، الهداف الحالي، أخبار سوق).
@@ -968,7 +983,7 @@ SYSTEM_PROMPT = """أنت مولّد أسئلة لعبة كروية عربية. 
 - علامات ترقيم زائدة، أو أقواس مربعة، أو شرح داخل نص السؤال.
 - تكرار نفس الفكرة بأكثر من صيغة في الدفعة.
 
-مواضيع مسموحة وآمنة: تاريخ كأس العالم، بطولات الأندية، قوانين اللعبة، أرقام قياسية ثابتة، جغرافية الملاعب، المنتخبات، نجوم معروفون بإنجازاتهم الموثقة.
+مواضيع مسموحة وآمنة: تاريخ كأس العالم، بطولات الأندية، قوانين اللعبة، أرقام قياسية ثابتة، جغرافية الملاعب، المنتخبات، ونجوم معروفون بإنجازاتهم الموثقة.
 
 أرجع JSON فقط بالشكل:
 {"questions": [
@@ -2274,12 +2289,13 @@ def self_test() -> int:
     check("similarity 1 للمتشابه", similarity("كرةالقدم", "كرةالقدم") == 1.0)
     check("similarity 0 للفارغ", similarity("", "x") == 0.0)
 
-    if failures:
-        print(f"❌ {len(failures)} اختبار فشل:")
-        for item in failures:
-            print(f"   - {item}")
-        return 1
     # --- سياسة الصعوبة (QUESTION_BOT_DIFFICULTY) ---
+    check("الافتراضي mostly_hard", DEFAULT_DIFFICULTY_POLICY == "mostly_hard")
+    if not _env("QUESTION_BOT_DIFFICULTY"):
+        check("الإعداد الفعلي من غير override يستخدم mostly_hard",
+              DIFFICULTY_POLICY_RAW == DEFAULT_DIFFICULTY_POLICY)
+    check("preset mostly_hard = 50/35/15", parse_difficulty_policy("mostly_hard") == {"hard": 10, "medium": 7, "easy": 3})
+    check("preset medium_hard من غير سهل", parse_difficulty_policy("medium_hard") == {"medium": 1, "hard": 1})
     check("preset mixed = 3 مستويات", parse_difficulty_policy("mixed") == {"easy": 1, "medium": 1, "hard": 1})
     check("preset غير معروف → mixed", parse_difficulty_policy("خرافية") == {"easy": 1, "medium": 1, "hard": 1})
     check("أوزان صريحة", parse_difficulty_policy("easy=1,medium=2,hard=1") == {"easy": 1, "medium": 2, "hard": 1})
@@ -2287,6 +2303,22 @@ def self_test() -> int:
           parse_difficulty_policy("easy=1,nope=9") == {"easy": 1})
     check("صعوبة أحادية بتصفّي الأوزان", parse_difficulty_policy("hard") == {"hard": 1})
 
+    saved_weights = globals()["DIFFICULTY_WEIGHTS"]
+    globals()["DIFFICULTY_WEIGHTS"] = parse_difficulty_policy("mostly_hard")
+    hard_plan = plan_difficulties(20)
+    check(
+        "mostly_hard يخطط 10 صعب / 7 متوسط / 3 سهل من 20",
+        hard_plan.count("hard") == 10
+        and hard_plan.count("medium") == 7
+        and hard_plan.count("easy") == 3,
+    )
+    globals()["DIFFICULTY_WEIGHTS"] = parse_difficulty_policy("medium_hard")
+    medium_hard_plan = plan_difficulties(20)
+    check(
+        "medium_hard ما يخططش أسئلة سهلة",
+        all(level in ("medium", "hard") for level in medium_hard_plan),
+    )
+    globals()["DIFFICULTY_WEIGHTS"] = parse_difficulty_policy("mixed")
     plan = plan_difficulties(6)
     check("التوزيع بيغطي العدد المطلوب", len(plan) == 6)
     check("التوزيع المتوازن بيشمل التلات مستويات", set(plan) == {"easy", "medium", "hard"})
@@ -2297,6 +2329,7 @@ def self_test() -> int:
         "دفعة صغيرة مابتسبورش مستوى whole",
         len(with_counts) == 4 and len(set(with_counts)) >= 2,
     )
+    globals()["DIFFICULTY_WEIGHTS"] = saved_weights
 
     # enforce: السياسة الأحادية بتجبّر حتى لو النموذج خالف
     saved_forced = globals()["FORCED_DIFFICULTY"]
@@ -2314,6 +2347,12 @@ def self_test() -> int:
           "سهل 2" in line and "صعب 1" in line and "difficulty" in line)
     check("الترتيب ثابت (easy قبل medium قبل hard)",
           line.index("سهل") < line.index("متوسط") if "متوسط" in line else True)
+    check(
+        "SYSTEM_PROMPT يطلب تفاصيل احترافية ويرفض الأسئلة البديهية",
+        all(phrase in SYSTEM_PROMPT for phrase in (
+            "تشكيلات نهائيات", "لا تخمّن", "كم عدد لاعبي الفريق؟", "ما لون كارت الطرد؟"
+        )),
+    )
 
     # --- حارس الميزانية ---
     budget = RequestBudget(2)
@@ -2370,8 +2409,8 @@ def self_test() -> int:
           LLM_ACCEPTS_MAX_TOKENS is None or isinstance(LLM_ACCEPTS_MAX_TOKENS, bool))
     # الدفعة الكبيرة لازم تكون أكبر من المطلوب مش أقل — وإلا هنطلب 40 ونستنى 60
     plan_big = plan_difficulties(LLM_MAX_BATCH)
-    check("خطة الصعوبة بقت متوازنة على الدفعة الكبيرة",
-          len(plan_big) == LLM_MAX_BATCH and len(set(plan_big)) >= 2)
+    check("خطة الصعوبة تغطي الدفعة الكبيرة بمستويات صالحة",
+          len(plan_big) == LLM_MAX_BATCH and all(level in VALID_DIFFICULTIES for level in plan_big))
 
     # --- محلّل نتيجة تدقيق الإجابات ---
     w, u = parse_verification_json('{"wrong":[{"index":1,"why":"الفريق غلط"}],"unsure":[{"index":3,"why":"سنة مشكوك فيها"}]}')
@@ -2421,6 +2460,12 @@ def self_test() -> int:
     # --- الموعد الذاتي لازم يبقى أقل من سقف الـworkflow (35 د) بفارق أمان ---
     check("الموعد الافتراضي تحت سقف الـworkflow", 0 < RUN_DEADLINE_SECONDS <= 35 * 60 - 300)
 
+    if failures:
+        print(f"❌ {len(failures)} اختبار فشل:")
+        for item in failures:
+            print(f"   - {item}")
+        return 1
+
     print("✅ كل الاختبارات المدمجة عدّت")
     return 0
 
@@ -2454,7 +2499,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="تدقيق صحة الإجابة: off=بدون، demote=المشبوه pending، drop=يترفض")
     parser.add_argument("--verify-model", default=None, help="موديل المراجعة (أقوى لما يكون مختلف)")
     parser.add_argument("--difficulty", default=None,
-                        help="mixed | easy | medium | hard | mostly_easy | mostly_hard | medium_hard | easy=1,medium=2,hard=1")
+                        help="mostly_hard (افتراضي) | hard (كلها صعب) | medium_hard | mixed | easy | medium | mostly_easy | easy=1,medium=2,hard=1")
     parser.add_argument("--curated", default=os.path.join(os.path.dirname(__file__), "questions_curated.json"))
     parser.add_argument("--game-types", default=",".join(VALID_GAME_TYPES))
     parser.add_argument("--self-test", action="store_true", help="يشغّل الاختبارات المدمجة ويقف")
