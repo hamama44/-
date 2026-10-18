@@ -192,6 +192,13 @@ VIEW_FEED = "questions_feed"
 #: المجانية الزحمة — والـtimeout القصير بيقطع رد سليم فينفعشه.
 HTTP_TIMEOUT_SECONDS = int(_env("LLM_TIMEOUT_SECONDS", default="120"))
 
+#: ⏱️ حد زمني ذاتي بالثواني. الـworkflow ليه `timeout-minutes`، ولما يتعدّاه
+#: GitHub بيبعت SIGTERM للـpython3 **من غير ما اللوج يتفلش** فالفشل بيطلع
+#: صامت ومafiش تشخيص (حصل فعلًا: تشغيل 21 سؤال/نوع اتقطع عند 12 دقيقة).
+#: الأفضل البوت يوقف نفسه بدري، ينشّط اللي جمعه، ويطبع السبب. 0 = بدون حد.
+#: لازم يفضل أقل من timeout-minutes × 60 بفارق كافي للنشر.
+RUN_DEADLINE_SECONDS = int(_env("QUESTION_BOT_RUN_DEADLINE_SECONDS", default="1500"))
+
 #: هل السؤال يوصل اللاعب على طول؟ False ⇒ ينحفظ بـ status='pending' فيفضل
 #: مخزّن ومش ظاهر (الـview والتطبيق بيقرا published بس)، فتقدر تراجع
 #: الدفعة في Supabase Studio وتوافق عليها دفعة واحدة. مفيد جداً لما السقف
@@ -225,7 +232,32 @@ VERIFY_BATCH = int(_env("QUESTION_BOT_VERIFY_BATCH", default="20"))
 #: موديل المراجعة. لو فاضي = نفس الموديل (بيلقط أخطاء الصياغة والثقة)، ولو
 #: مختلف = مراجعة مستقلة فعلًا وده أقوى بكتير في كشف المعلومة المخترعة
 #: (نفس الموديل بيميل يوافق على إجابته). مثال: openrouter/deepseek-r1:free
-VERIFY_MODEL = _env("LLM_MODEL_VERIFY")
+def sanitize_verify_model(value: str) -> tuple:
+    """
+    LLM_MODEL_VERIFY مكانه **اسم موديل**، بس ناس كتير بتحط فيه الـAPI key
+    (خصوصاً لو اتحط في GitHub Variables بدل Secrets). النتيجة سيئة مزدوجة:
+    كل طلب مراجعة بيرجع 400 عشان الـpayload فيه `"model": "sk-..."`، والقيمة
+    بتطبع في اللوج لأن الـVariables مش سرية. نرفض أي قيمة شبه المفتاح.
+    """
+    value = (value or "").strip()
+    if not value:
+        return "", ""
+    looks_key = value.startswith(("sk-", "Bearer ", "bearer ")) or (
+        "/" not in value and len(value) >= 32
+    )
+    if looks_key:
+        return "", (
+            f"LLM_MODEL_VERIFY طولها {len(value)} حرف ومافيهاش '/' — دي شكل مفتاح "
+            "مش اسم موديل. اتجاهلتها والمراجعة هتتم بنفس موديل التوليد. المفاتيح "
+            "بتتحط في Secrets (مش Variables): الـVariables بتتطبع نصّها الصريح في "
+            "لوجات Actions، فامسحها ولفّها (rotate)."
+        )
+    return value, ""
+
+
+VERIFY_MODEL, _VERIFY_MODEL_WARNING = sanitize_verify_model(_env("LLM_MODEL_VERIFY"))
+if _VERIFY_MODEL_WARNING:
+    print(f"   \u26a0\ufe0f  {_VERIFY_MODEL_WARNING}", flush=True)
 
 #: أقصى عدد أسئلة ينشره البوت في اليوم — الحد اللي طلبته (250/يوم).
 #: الحماية دي لوحدها اللي بتمنع يوم يسبّب فيه الموديل هلوسة جماعية تفخّ الجدول.
@@ -711,6 +743,9 @@ def fetch_existing(
             hashes = [str(r.get("content_hash")) for r in got if isinstance(r, dict)]
     except (RuntimeError, Rejected) as error:
         print(f"   ⚠️ فشل جلب البصمات ({error}) — هنكتفي بنصوص العينة")
+        hint = schema_hint(error)
+        if hint:
+            print(hint, file=sys.stderr)
 
     text_params = (
         f"questions?select=question,options,correct_index,game_type,content_hash"
@@ -1701,6 +1736,25 @@ def collect_for_game_type(
     return accepted, rejected_count
 
 
+def schema_hint(error: Any) -> str:
+    """
+    أخطاء PostgREST اللي معناها «السكيما قديمة» بتيجي كـ400/404 نصّها
+    `column ... does not exist` أو `relation ... does not exist`. دي مش
+    مشكلة اتصال ولا مفتاح — وحدها الـv3 SQL ما اتنفّذش. نطق الحل بدل ما
+    المستخدم يلفش في اللوج.
+    """
+    text = str(error)
+    if "does not exist" in text or "42703" in text or "42P01" in text:
+        return (
+            "   \U0001f4a1 العمود/الـview مش موجود في الـdatabase: نفّذ "
+            "app/src/main/assets/supabase_schema_v3.sql في Supabase SQL Editor "
+            "(و v2 قبله لو أول مرة)، وبعدين أعد التشغيل."
+        )
+    if "apikey" in text.lower() or "401" in text or "JWT" in text:
+        return "   \U0001f4a1 مفاتيح Supabase مرفوضة: راجح SUPABASE_SERVICE_ROLE_KEY في Secrets."
+    return ""
+
+
 def run(
     limit: int,
     dry_run: bool,
@@ -1710,6 +1764,7 @@ def run(
 ) -> int:
     """التشغيل الكامل. بيرجع 0 نجاح و 1 فشل جزئي و 2 فشل كامل."""
     started = time.time()
+    deadline_at = started + RUN_DEADLINE_SECONDS if RUN_DEADLINE_SECONDS > 0 else 0.0
     log: List[str] = []
     mode = "نشر فورى للاعيبين" if AUTO_PUBLISH else "pending للمراجعة (مابيوصلش اللاعب)"
     print(f"▶️  سؤال بوت V3 — الحد اليومي {DAILY_CAP} | dry_run={dry_run} | {mode}")
@@ -1755,6 +1810,9 @@ def run(
         except Exception as error:
             # لو الفشل في العدّ نقف بأمان: أأمن من تجاوز الحد اليومي
             print(f"   ❌ فشل عدّ المنشور اليوم: {error}", file=sys.stderr)
+            hint = schema_hint(error)
+            if hint:
+                print(hint, file=sys.stderr)
             return 2
         if already_today >= DAILY_CAP:
             print(f"   ⛔ وصلنا الحد اليومي ({already_today}/{DAILY_CAP}) — مفيش نشر النهاردة")
@@ -1769,7 +1827,16 @@ def run(
         print("   ⛔ الميزانية صفر بعد الحد اليومي")
         return 0
 
-    for game_type in game_types:
+    for gt_index, game_type in enumerate(game_types):
+        if deadline_at and time.time() > deadline_at:
+            print(
+                f"   \u23f3 وقت التشغيل خلص بعد {time.time() - started:.0f} ثانية — "
+                f"فاضل {len(game_types) - gt_index} نوع من غير توليد. "
+                "الحل: نزّل limit، أو نزّل LLM_MAX_BATCH (الدفعة الكبيرة هي اللي "
+                "بتاخد الدقايق)، أو زوّت timeout-minutes في الـworkflow.",
+                file=sys.stderr,
+            )
+            break
         try:
             existing = fetch_existing(game_type)
         except Exception as error:
@@ -1781,6 +1848,9 @@ def run(
                 existing = []
             else:
                 print(f"   ❌ فشل قراءة الأسئلة الموجودة لـ{game_type}: {error}", file=sys.stderr)
+                hint = schema_hint(error)
+                if hint:
+                    print(hint, file=sys.stderr)
                 return 2
 
         print(f"   {game_type}: {len(existing)} سؤال موجود في القاعدة")
@@ -2331,6 +2401,26 @@ def self_test() -> int:
                                  "correct_index": 5, "explanation": ""}])
     check("فهرس خارج الحدود مابيكسرش", "غير محددة" in vpidx)
 
+    # --- sanitize_verify_model: الحقل ده اسم موديل مش مفتاح ---
+    fake_key = "sk-" + "k" * 44  # قيمة بشكل مفتاح — مش مفتاح حقيقي
+    ok_model, warn = sanitize_verify_model(fake_key)
+    check("مفتاح في LLM_MODEL_VERIFY بيرفض", ok_model == "" and "Variables" in warn)
+    check("اسم موديل سليم بيمشي",
+          sanitize_verify_model("google/gemma-4-31b-it:free") == ("google/gemma-4-31b-it:free", ""))
+    check("اسم قصير من غير سلاش مابيتلغاش", sanitize_verify_model("gpt-4o") == ("gpt-4o", ""))
+    check("فاضي يفضل فاضي", sanitize_verify_model("") == ("", ""))
+    check("المسافات الزيادة بتتنضف", sanitize_verify_model("  a/b:free  ") == ("a/b:free", ""))
+
+    # --- schema_hint: يفرّق «سكيما ناقصة» عن «اتصال/مفتاح» ---
+    e400 = 'HTTP 400: {"code":"42703","message":"column questions.content_hash does not exist"}'
+    check("42703 بيقول نفّذ v3", "supabase_schema_v3.sql" in schema_hint(e400))
+    check("42P01 كمان", "supabase_schema_v3.sql" in schema_hint('HTTP 404: relation "questions_feed" does not exist'))
+    check("401 بيقول راجح المفتاح", "SERVICE_ROLE" in schema_hint("HTTP 401: invalid JWT"))
+    check("خطأ عادي مابيلفّقش تلميح", schema_hint("HTTP 500: server busy") == "")
+
+    # --- الموعد الذاتي لازم يبقى أقل من سقف الـworkflow (35 د) بفارق أمان ---
+    check("الموعد الافتراضي تحت سقف الـworkflow", 0 < RUN_DEADLINE_SECONDS <= 35 * 60 - 300)
+
     print("✅ كل الاختبارات المدمجة عدّت")
     return 0
 
@@ -2340,6 +2430,14 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # ⚠️ من غير السطر ده اللوج بيفضل فاضي لو الـrunner قتل العملية (block
+    # buffering على non-tty) — وكل الـdiagnostics بتضيع مع الـSIGTERM.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="بوت إضافة أسئلة لملعب التحدي")
     parser.add_argument("--limit", type=int, default=6,
                         help="أقصى عدد أسئلة لكل نوع في التشغيل (افتراضي 6)")
