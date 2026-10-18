@@ -136,6 +136,23 @@ interface CloudQuestionDao {
     )
     suspend fun pruneGameTypeNotIn(gameType: String, keepIds: List<String>): Int
 
+    /**
+     * يقصّ أقدم الأسئلة في النوع الواحد عشان الكاش مايكبرش للأبد.
+     *
+     * بيشيل من `publishedAtMillis` الأقدم لحد ما يفضل [keep] — يعني المحتوى
+     * الجديد دايماً محفوظ، والقديم بيتنضّف. ده آمن لأن الأصل في Supabase
+     * (مفيش فقدان بيانات) ولأن الأسئلة المضمّنة في APK قائمة لوحدها.
+     *
+     * `LIMIT` جوه الـsubquery قانوني في SQLite، و`id` مفتوح أساسي فمش
+     * محتاجين ROWID.
+     */
+    @Query(
+        "DELETE FROM cloud_questions WHERE gameType = :gameType AND id NOT IN (" +
+            "SELECT id FROM cloud_questions WHERE gameType = :gameType " +
+            "ORDER BY publishedAtMillis DESC LIMIT :keep)"
+    )
+    suspend fun pruneGameTypeOverflow(gameType: String, keep: Int): Int
+
     @Query("DELETE FROM cloud_questions")
     suspend fun clearAll()
 }

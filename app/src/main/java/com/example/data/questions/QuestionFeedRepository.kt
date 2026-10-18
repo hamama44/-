@@ -38,12 +38,16 @@ class QuestionFeedRepository(
     private val fetchLimitPerType: Int = SupabaseQuestionsDao.DEFAULT_LIMIT
 ) {
 
+
     /**
      * نتيجة مزامنة واحدة — للعرض في الإعدادات وللتشخيص.
      *
      * @param fetchedTotal عدد الصفوف اللي رجعت من السيرفر (بعد فلترة غير الصالح).
      * @param cachedTotal عدد الصفوف اللي اتخزّنت فعلياً.
-     * @param prunedTotal عدد الصفوف القديمة اللي اتشالت (0 لو اللقطة مش كاملة).
+     * @param prunedTotal الصفوف اللي اتشالت: المكررات اللي اختفت من السيرفر
+     *  (0 لو اللقطة مش كاملة) **+** أقدم صفوف الكاش اللي تجاوزت
+     *  [CACHE_CAP_PER_TYPE]. الاتنين اتحطوا في رقم واحد لأن الرد بيهم
+     *  المستخدم كـ«الكاش اتنضّف»، والتفريق بيتشاف في اللوج.
      * @param failedTypes الأنواع اللي فشل جلبها — بتخلي الواجهة تقول «مزامنة
      *  ناقصة» بدل «مافيش أسئلة جديدة» وده فرق كبير للمستخدم.
      */
@@ -82,6 +86,7 @@ class QuestionFeedRepository(
         var fetched = 0
         var cached = 0
         var pruned = 0
+        var trimmed = 0
         val failed = mutableListOf<String>()
 
         SupabaseQuestionsDao.DEFAULT_TYPES.forEach { (gameType, configuredLimit) ->
@@ -117,12 +122,16 @@ class QuestionFeedRepository(
             if (snapshotIsComplete) {
                 pruned += dao.pruneGameTypeNotIn(gameType, entities.map { it.id })
             }
+
+            // سقف الحجم بيشتغل في كل الأحوال: ده مش «تنضيف» لبيانات مش
+            // موجودة، ده رمي الأقدم من كاش بقى أكبر من اللازم.
+            trimmed += dao.pruneGameTypeOverflow(gameType, CACHE_CAP_PER_TYPE)
         }
 
         return SyncResult(
             fetchedTotal = fetched,
             cachedTotal = cached,
-            prunedTotal = pruned,
+            prunedTotal = pruned + trimmed,
             failedTypes = failed
         )
     }
@@ -181,6 +190,21 @@ class QuestionFeedRepository(
     suspend fun cloudCount(): Int = dao.getTotalCount()
 
     companion object {
+        /**
+         * أقصى عدد سؤال سحابي مخزّن لكل نوع لعبة على الجهاز.
+         *
+         * السقف ده لازم مع النشر الكثيف: البوت بيوصل ~62 سؤال جديد لكل نوع
+         * في اليوم، ومن غير قصّ الهيوصل الكاش ~23 ألف صف للنوع في السنة.
+         * ده مابيكسرش Room، بس بيفلتر كل جولة: القائمة بتتحمل كاملة →
+         * تُدمج → تُخلَّط قبل ما الـtake يختار 15، فكل ثانية في المسار ده
+         * بتتحسب على الجهاز مش على السيرفر.
+         *
+         * 400 = ~6 أيام نشر لكل نوع، ولسه عينة الخلط كبيرة كفاية إن اللاعب
+         * مايعيدش نفس الأسئلة. لو رفعت `QUESTION_BOT_DAILY_CAP` فوق 250
+         * ارفع الرقم ده معاه.
+         */
+        const val CACHE_CAP_PER_TYPE = 400
+
         @Volatile
         private var instance: QuestionFeedRepository? = null
 
