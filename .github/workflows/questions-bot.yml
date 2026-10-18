@@ -20,7 +20,17 @@ name: Question Bot (إضافة أسئلة تلقائياً)
 #   │ GEMINI_API_KEY             اختياري — بديل مباشر لو عايز Google الأصلي
 #   └──────────────────────────────────────────────────────────────────────
 #   ┌─ Variables (مش سرية — تتغيّر من الواجهة بدون edit للملف) ────────────
-#   │ LLM_MODEL                  google/gemini-2.5-flash-exp:free   (افتراضي)
+#   │ LLM_MODEL                  openrouter/free   (الراوتر بيختار أي موديل مجاني
+#   │                            متاح — محصّن ضد تغيير القائمة الأسبوعي. أي ID
+#   │                            قديم زي google/gemini-2.5-flash-exp:free مات من 2026)
+#   │ LLM_MODEL_VERIFY           **اسم موديل** — مش مفتاح! ⚠️ أي قيمة في
+#   │                            Variables بتطبع نصّها الصريح في لوجات Actions،
+#   │                            فمفتاح هنا = مفتاح مكشوف. المفاتيح في Secrets.
+#   │                            مثال: google/gemma-4-31b-it:free
+#   │ LLM_MAX_BATCH              15  (كل ما كبرت الدفعة زاد زمن الطلب وحده)
+#   │ LLM_TIMEOUT_SECONDS        150
+#   │ QUESTION_BOT_VERIFY        demote | off | drop
+#   │ QUESTION_BOT_RUN_DEADLINE_SECONDS  1500 (خليه أقل من timeout-minutes×60)
 #   │ LLM_BASE_URL               https://openrouter.ai/api/v1       (اختياري)
 #   │ LLM_PROVIDER               auto | openrouter | gemini          (اختياري)
 #   │ QUESTION_BOT_DIFFICULTY    mixed | easy | medium | hard |
@@ -124,9 +134,16 @@ jobs:
   add-questions:
     name: توليد ونشر الأسئلة
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # 12 دقيقة كانت بتقطع التشغيل الحقيقي (limit=21 على openrouter/free قعد
+    # 12:09 واتلغى: "The operation was canceled"). السقف ده لازم يبقى أكبر من
+    # QUESTION_BOT_RUN_DEADLINE_SECONDS بس، عشان البوت هو اللي يوقف نفسه ويطبع
+    # السبب — مش الـrunner اللي يقتل الـprocess ويضيّع اللوج.
+    timeout-minutes: 35
 
     env:
+      # من غيره اللوج يفضل فاضي لو العملية اتقتلت (block buffering على non-tty)
+      PYTHONUNBUFFERED: "1"
+
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
@@ -154,6 +171,9 @@ jobs:
       LLM_MAX_BATCH: ${{ vars.LLM_MAX_BATCH || '40' }}
       LLM_MAX_TOKENS: ${{ vars.LLM_MAX_TOKENS || '20000' }}
       LLM_TIMEOUT_SECONDS: ${{ vars.LLM_TIMEOUT_SECONDS || '120' }}
+      # البوت يوقف نفسه قبل timeout-minutes بـ6 دقايق، ينشّط اللي جمعه، ويطبع
+      # «نزّل limit أو LLM_MAX_BATCH» بدل فشل صامت. (35 د = 2100 ث - 600 = 1500)
+      QUESTION_BOT_RUN_DEADLINE_SECONDS: ${{ vars.QUESTION_BOT_RUN_DEADLINE_SECONDS || '1500' }}
       LLM_MAX_ATTEMPTS: ${{ vars.LLM_MAX_ATTEMPTS || '8' }}
 
       # --- تدقيق صحة الإجابة ---
@@ -181,16 +201,22 @@ jobs:
 
       - name: فحص الإعدادات
         run: |
+          # في dry-run مفيش كتابة للـdatabase ⇒ الأسرار مش شرط (البوت نفسه
+          # بيتجاهل فحص التكرار وقتها). في النشر الحقيقي بقى نقصها خطأ.
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
-            echo "::error::ناقص SUPABASE_URL أو SUPABASE_SERVICE_ROLE_KEY في Secrets"
-            exit 1
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              echo "::warning::ناقص SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY — في dry-run ماقاصر، لكن النشر الحقيقي محتاجهم"
+            else
+              echo "::error::ناقص SUPABASE_URL أو SUPABASE_SERVICE_ROLE_KEY في Secrets (Settings → Secrets and variables → Actions → Secrets)"
+              exit 1
+            fi
           fi
           if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$GEMINI_API_KEY" ]; then
             echo "::warning::مفيش OPENROUTER_API_KEY ولا GEMINI_API_KEY — هيتم نشر ملف curated فقط"
           elif [ -n "$OPENROUTER_API_KEY" ]; then
             echo "✅ التوليد على OpenRouter بالموديل: ${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}"
-            case "${OPENROUTER_MODEL:-google/gemini-2.5-flash-exp:free}" in
-              *:free) echo "ℹ️ موديل مجاني — حد OpenRouter 50 طلب/يوم و20/دقيقة" ;;
+            case "${OPENROUTER_MODEL:-openrouter/free}" in
+              *:free|openrouter/free|*/free) echo "ℹ️ موديل مجاني — حد OpenRouter 50 طلب/يوم و20/دقيقة" ;;
               *)      echo "ℹ️ موديل مدفوع — هيتحاسب من رصيدك على عدد التوكنات" ;;
             esac
           else
@@ -238,7 +264,7 @@ jobs:
             echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
             echo "- الموديل: \`${{ github.event.inputs.model || vars.LLM_MODEL || 'google/gemini-2.5-flash-exp:free' }}\`"
             echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mixed (سهل/متوسط/صعب بالتناوب)' }}\`"
-            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '12' }}\` · دفعة التوليد: \`${{ vars.LLM_MAX_BATCH || '40' }}\`"
+            echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '14' }}\` · دفعة التوليد: \`${{ vars.LLM_MAX_BATCH || '40' }}\`"
             if [ "${{ vars.QUESTION_BOT_AUTO_PUBLISH }}" = "false" ]; then
               echo "- وضع النشر: **pending للمراجعة** — مabiوصلش اللاعب لحد ما توافق 📝"
             else
