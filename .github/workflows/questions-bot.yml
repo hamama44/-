@@ -33,8 +33,8 @@ name: Question Bot (إضافة أسئلة تلقائياً)
 #   │ QUESTION_BOT_RUN_DEADLINE_SECONDS  1500 (خليه أقل من timeout-minutes×60)
 #   │ LLM_BASE_URL               https://openrouter.ai/api/v1       (اختياري)
 #   │ LLM_PROVIDER               auto | openrouter | gemini          (اختياري)
-#   │ QUESTION_BOT_DIFFICULTY    mixed | easy | medium | hard |
-#   │                            mostly_easy | mostly_hard | medium_hard
+#   │ QUESTION_BOT_DIFFICULTY    mostly_hard (افتراضي: 50% صعب/35% متوسط/15% سهل)
+#   │                            mixed | easy | medium | hard | mostly_easy | medium_hard
 #   │ QUESTION_BOT_DAILY_CAP     250
 #   │ QUESTION_BOT_AUTO_PUBLISH  true (=false → pending للمراجعة)
 #   └──────────────────────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ on:
         default: ""
         type: string
       difficulty:
-        description: "الصعوبة: فاضي=mixed، أو easy / medium / hard / mostly_hard / medium_hard"
+        description: "الصعوبة: فاضي=قيمة المتغير أو mostly_hard افتراضيًا؛ hard لكل الدفعة؛ أو medium_hard / mixed"
         required: false
         default: ""
         type: choice
@@ -263,7 +263,7 @@ jobs:
             echo "- كود الخروج: \`${BOT_EXIT_CODE:-?}\`"
             echo "- المصدر: \`${{ github.event.inputs.source || 'both' }}\` · dry-run: \`${{ github.event.inputs.dry_run || 'false' }}\`"
             echo "- الموديل: \`${{ github.event.inputs.model || vars.LLM_MODEL || 'google/gemini-2.5-flash-exp:free' }}\`"
-            echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mixed (سهل/متوسط/صعب بالتناوب)' }}\`"
+            echo "- الصعوبة: \`${{ github.event.inputs.difficulty || vars.QUESTION_BOT_DIFFICULTY || 'mostly_hard (50% صعب/35% متوسط/15% سهل)' }}\`"
             echo "- السقف اليومي: \`${{ vars.QUESTION_BOT_DAILY_CAP || '250' }}\` سؤال · ميزانية الطلبات: \`${{ vars.LLM_MAX_REQUESTS_PER_RUN || '14' }}\` · دفعة التوليد: \`${{ vars.LLM_MAX_BATCH || '40' }}\`"
             if [ "${{ vars.QUESTION_BOT_AUTO_PUBLISH }}" = "false" ]; then
               echo "- وضع النشر: **pending للمراجعة** — مabiوصلش اللاعب لحد ما توافق 📝"
