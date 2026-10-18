@@ -18,6 +18,7 @@
     python3 scripts/question_bot.py --dry-run --source curated
     python3 scripts/question_bot.py --limit 12 --source both
     python3 scripts/question_bot.py --self-test       # بدائل الاختبارات
+    python3 scripts/question_bot.py --doctor          # فحص المفتاح + Supabase + الـview
 
 المتغيرات البيئية (في CI بتيجي من GitHub Secrets، ومحلياً من ملف .env):
     SUPABASE_URL        مثال https://xyzcompany.supabase.co
@@ -1867,6 +1868,185 @@ def run(
 # اختبارات مدمجة — بتشتغل على أي Python بدون pytest
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# تشخيص الإعداد — --doctor
+# ---------------------------------------------------------------------------
+# الفحص ده مكتوب عشان سؤال من نوع «حطيت المفتاح، اشتغل؟». كل نقطة بتتحقق
+# من حاجة منفصلة (مفتاح / شبكة / قاعدة / view / أعمدة V3) وبتطبع السطر
+# اللي يصلحها بالظبط، فمابقاش لازم تتخمن من أنهي طبقة الفشل جاي.
+
+def _fmt(ok: Optional[bool], label: str, detail: str = "", fix: str = "") -> str:
+    mark = "✅" if ok else ("⏭️ " if ok is None else "❌")
+    line = f"  {mark} {label}"
+    if detail:
+        line += f" — {detail}"
+    if not ok and fix:
+        line += f"\n      ↳ {fix}"
+    return line
+
+
+def doctor() -> int:
+    """
+    يفحص الإعداد من غير ما يكتب أي حاجة في القاعدة.
+    بيرجع 0 لو كل حاجة تمام، و1 لو فيه نقطة ناقصة.
+    """
+    print("=" * 68)
+    print("🩺 تشخيص إعداد بوت الأسئلة")
+    print("=" * 68)
+    problems = 0
+    if LOADED_DOTENV:
+        print(f"   (قريت {os.path.basename(LOADED_DOTENV)} — ملف سرّي، مش متتبَّع في Git)")
+    note = dotenv_warning()
+    if note:
+        print(note)
+        problems += 1
+
+    # --- 1) مفتاح الـLLM ---
+    print("\nالمزوّد:")
+    provider = resolve_provider()
+    key = LLM_API_KEY or GEMINI_API_KEY
+    if provider == "none":
+        print(_fmt(False, "مفيش مفتاح LLM", fix="ضيف OPENROUTER_API_KEY أو GEMINI_API_KEY في scripts/.env"))
+        problems += 1
+    else:
+        shape = "شكله مفتاح OpenRouter ✓" if LLM_API_KEY.startswith("sk-or-") else (
+            "مفتاح Gemini ✓" if provider == "gemini" else "مفتاح عام ✓"
+        )
+        # أطوال قصيرة = مفتاح اتقطع وهو بيتنسخ (غلط شائع جدًا)
+        if len(key) < 24:
+            print(_fmt(False, f"المفتاح قصير ({len(key)} حرف)", fix="المفتاح اتبتر وقت النسخ — الصقه تاني كامل"))
+            problems += 1
+        else:
+            print(_fmt(True, f"مزوّد: {provider}", f"{LLM_MODEL if provider == 'openai' else GEMINI_MODEL} · {shape}"))
+
+    if VERIFY_POLICY != "off" and provider != "none" and not VERIFY_MODEL:
+        print(_fmt(None, "تدقيق الإجابات بموديل نفس المولّد",
+                   "بيشتغل بس بيفوّت الأخطاء المخترعة — زوّد LLM_MODEL_VERIFY بموديل تاني"))
+
+    # --- 2) وصلة المزوّد (طلب واحد خفيف) ---
+    if provider == "openai" and LLM_API_KEY:
+        base = (OPENROUTER_BASE_URL or "").rstrip("/")
+        probe = base[:-len("/chat/completions")] if base.endswith("/chat/completions") else base
+        url = probe + "/auth/key"
+        print("\nاتصال بالمزوّد:")
+        try:
+            body = http_json("GET", url, headers={"Authorization": f"Bearer {LLM_API_KEY}"}, retries=1)
+            data = body.get("data") if isinstance(body, dict) else None
+            if isinstance(data, dict):
+                usage = data.get("usage")
+                limit = data.get("limit")
+                free = data.get("is_free_tier")
+                bits = [f"الاستهلاك: {usage if usage is not None else '؟'}"]
+                if limit is not None:
+                    bits.append(f"الحد: {limit}")
+                if free is not None:
+                    bits.append("طبقة مجانية" if free else "طبقة مدفوعة")
+                print(_fmt(True, f"المفتاح شغال ✓ ({data.get('label') or 'no label'})", " · ".join(bits)))
+                print(
+                    "      ℹ️  حد الطبقة المجانية على موديلات :free هو 50 طلب/يوم و20/دقيقة — "
+                    "البوت محتاج ~32/يوم لـ250 سؤال"
+                )
+            else:
+                print(_fmt(True, "المزوّد رد ✓", "الشكل مش متوقع — ماحدش يتوقف على ده"))
+        except Exception as error:  # الشبكة/الصلاحية الاتنين رسالة واحدة مفيدة
+            msg = str(error)
+            low = msg.lower()
+            if "401" in msg or "403" in msg or "invalid" in low or "unauthorized" in low:
+                print(_fmt(False, "المفتاح مرفوض من المزوّد",
+                           fix="اتأكد إنه من openrouter.ai/keys كامل ومن غير مسافات، ومش منتهي الصلاحية"))
+            elif any(t in low for t in ("ssl", "eof", "timed out", "timeout", "unreachable",
+                                        "refused", "urlopen", "name or service", "network")):
+                print(_fmt(False, "مافيش وصول للمزوّد من هنا", msg[:90],
+                           fix="البيئة دي مسموحلها بس بـ github/pypi/npm فالتوليد هييجي error دايمًا هنا. "
+                               "شغّل --doctor على جهازك للتأكد من المفتاح؛ الفشل ده مش معناه إن المفتاح غلط."))
+            else:
+                print(_fmt(False, "فشل فحص المفتاح", msg[:120]))
+            problems += 1
+    else:
+        print("\nاتصال بالمزوّد: ⏭️  اتخطّى (مافيش مفتاح عام)")
+
+    # --- 3) Supabase ---
+    print("\nSupabase:")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print(_fmt(False, "مفيش SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY",
+                   fix="SUPABASE_URL من Project Settings → API، والمفتاح منเดียวกัน (service_role)"))
+        problems += 1
+    elif not SUPABASE_URL.startswith("https://"):
+        print(_fmt(False, f"URL مش https: {SUPABASE_URL}", fix="استخدم رابط المشروع الكامل https://xxxx.supabase.co"))
+        problems += 1
+    else:
+        # feed: لازم الـview يبقى موجود (الـanon والتطبيق بيقروا منه)
+        try:
+            rows = http_json(
+                "GET", rest_url("questions_feed?select=id&limit=1"),
+                headers=service_headers(), retries=1
+            )
+            if isinstance(rows, list):
+                print(_fmt(True, "view `questions_feed` موجود ✓", f"{len(rows)} صف في أول صفحة"))
+            else:
+                print(_fmt(False, "رد غير متوقع من questions_feed", str(rows)[:100]))
+                problems += 1
+        except Exception as error:
+            msg = str(error)
+            if "404" in msg or "does not exist" in msg or "relation" in msg:
+                print(_fmt(False, "questions_feed مش موجود",
+                           fix="نفّذ app/src/main/assets/supabase_schema_v3.sql في Supabase SQL Editor"))
+            else:
+                print(_fmt(False, "فشل الوصول للـview", msg[:120]))
+            problems += 1
+
+        # أعمدة V3: البوت بكتب فيهم، ولو الـmigration ما اتعملتش الكتابة تفشل
+        try:
+            http_json(
+                "GET",
+                rest_url("questions?select=id,content_hash,source,status,published_at,review_note&limit=1"),
+                headers=service_headers(), retries=1
+            )
+            print(_fmt(True, "أعمدة V3 كلها موجودة ✓ (content_hash/source/status/published_at/review_note)"))
+        except Exception as error:
+            print(_fmt(False, "ناقص أعمدة من V3", str(error)[:110]
+                       + " — شغّل supabase_schema_v3.sql"))
+            problems += 1
+
+        try:
+            n = count_published_last_24h()
+            print(_fmt(True, f"المنشور في آخر 24 ساعة: {n}", f"من أصل سقف {DAILY_CAP}"))
+        except Exception as error:
+            print(_fmt(False, "قراية السقف اليومي فشلت", str(error)[:110]))
+            problems += 1
+
+    # --- 4) ملف curated ---
+    print("\nالمحتوى:")
+    curated_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "questions_curated.json")
+    rows = load_curated(curated_path) if os.path.isfile(curated_path) else []
+    if rows:
+        ok_rows = 0
+        reasons: List[str] = []
+        for r in rows:
+            try:
+                validate_question(r)
+                ok_rows += 1
+            except Rejected as reason:
+                reasons.append(str(reason))
+        # الـRejected مش خطأ في الفحص — ملف الـcurated بتاعنا فيه عمداً
+        # مثال مرفوض عشان يورّي القواعد شغالة، فالعرض يكون بالرقمين.
+        detail = f"{ok_rows}/{len(rows)} يجتاز التدقيق"
+        if reasons:
+            detail += " · المرفوض: " + "، ".join(sorted(set(reasons))[:3])
+        print(_fmt(True, "questions_curated.json", detail))
+    else:
+        print(_fmt(None, "مافيش أسئلة curated", "التوليد هي المصدر الوحيد (اختياري)"))
+
+    # --- 5) القرار ---
+    print("\n" + "=" * 68)
+    if problems == 0:
+        print("✅ جاهز للتشغيل:  python3 scripts/question_bot.py --limit 21")
+    else:
+        print(f"⚠️  {problems} نقطة ناقصة — صلّحها اللي فوق ورجّع شغّل --doctor تاني")
+    print("=" * 68)
+    return 1 if problems else 0
+
+
 def self_test() -> int:
     """اختبارات وحدة مصغّرة لمنطق التدقيق والبصمة (مفيش شبكة خالص)."""
     failures: List[str] = []
@@ -2180,10 +2360,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--curated", default=os.path.join(os.path.dirname(__file__), "questions_curated.json"))
     parser.add_argument("--game-types", default=",".join(VALID_GAME_TYPES))
     parser.add_argument("--self-test", action="store_true", help="يشغّل الاختبارات المدمجة ويقف")
+    parser.add_argument("--doctor", action="store_true",
+                        help="يفحص المفتاح/الوصلة/الـview/الأعمدة من غير ما يكتب أي حاجة")
     args = parser.parse_args(argv)
 
     if args.self_test:
         return self_test()
+    if args.doctor:
+        return doctor()
 
     game_types = tuple(g.strip() for g in args.game_types.split(",") if g.strip() in VALID_GAME_TYPES)
     if not game_types:
