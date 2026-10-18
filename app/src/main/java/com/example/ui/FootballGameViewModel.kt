@@ -1357,7 +1357,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
     fun startThirtySecondsQuiz() {
         // بنقرأ من الـfeed الحي: أسئلة البوت الأول + المضمّن بدون تكرار
         maybeRefreshQuestionFeed()
-        val questions = liveThirtySeconds.value.shuffled()
+        val questions = liveThirtySeconds.value.shuffled().take(ROUND_LENGTH_THIRTY_SECONDS)
         _tsQuestions.value = questions
         _tsCurrentIndex.value = 0
         _tsScore.value = 0
@@ -1546,7 +1546,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
     fun startSabahoChallenge() {
         maybeRefreshQuestionFeed()
-        val questions = liveSabaho.value.shuffled()
+        val questions = liveSabaho.value.shuffled().take(ROUND_LENGTH_SABAHO)
         _sabahoQuestions.value = questions
         _sabahoIndex.value = 0
         _sabahoScore.value = 0
@@ -1809,7 +1809,7 @@ class FootballGameViewModel(application: Application) : AndroidViewModel(applica
 
     fun startTrueFalseGame() {
         maybeRefreshQuestionFeed()
-        val list = liveTrueFalse.value.shuffled()
+        val list = liveTrueFalse.value.shuffled().take(ROUND_LENGTH_TRUE_FALSE)
         _tfQuestions.value = list
         _tfIndex.value = 0
         _tfStreak.value = 0
@@ -3374,6 +3374,29 @@ private const val REALTIME_REFRESH_DEBOUNCE_MS = 400L
  * الجلسة الجاية.
  */
 private const val QUESTION_FEED_MIN_REFRESH_MS = 10 * 60 * 1000L
+
+/**
+ * طول الجولة لكل لعبة.
+ *
+ * الأرقام دي مش اختراع: هي **عدد الأسئلة المضمّنة في APK** لكل لعبة
+ * (15 / 9 / 8)، فالجولة بتفضل بنفس الإحساس بالظبط. الفرق إن المصادر
+ * اتبدلت: قبل كده كانت «كل المحتوى اللي عندنا»، ودلوقتي «عينة عشوائية
+ * من مخزون بيكبر كل يوم».
+ *
+ * ليه لازم تكون ثابتة؟ لأن التلات ألعاب بتخلص لما القائمة تخلص
+ * (`index + 1 < questions.size`). من غير `take`، بعد أسبوع واحد من نشر
+ * البوت هتبقى الجولة ~450 سؤال — وده مكسور في حد ذاته: في «صباحو» كل
+ * سؤال ليه 25 ثانية، فجلسة 450 سؤال معناها نظرياً ساعتين اللعب.
+ * والعينة العشوائية بتضمن إن السؤال الجديد بيظهر رغم إن الجولة قصيرة.
+ */
+private const val ROUND_LENGTH_THIRTY_SECONDS = 15
+private const val ROUND_LENGTH_SABAHO = 9
+private const val ROUND_LENGTH_TRUE_FALSE = 16
+
+/**
+ * «صح/غلط» أطول شوية (16 بدل 8) لأن مفيش وقت لكل سؤال فيها، والمضمّن
+ * كان صغير جداً فالتنويع بيوصل أحسن. لو عايزها أطول: رقم واحد بيتغير هنا.
+ */
 
 /** نتائج تجريبية للوحة الصدارة عندما لا يوجد سيرفر مُهيّأ. */
 private fun demoCloudScores(): List<SupabaseScore> = listOf(
